@@ -1,20 +1,26 @@
-[project]
-name = "kiwoombank"
-version = "0.1.0"
-description = ""
-authors = [
-    {name = "윤철진",email = "zzini03182@hotmail.com"}
-]
-readme = "README.md"
-requires-python = ">=3.12"
-dependencies = [
-    "fastapi (>=0.119.0,<0.120.0)",
-    "uvicorn (>=0.37.0,<0.38.0)"
-]
-
-[tool.poetry]
-packages = [{include = "kiwoombank", from = "src"}]
-
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kiwoom_finance"
+version = "0.1.0"
+description = "Batch financial metrics from DART for credit analysis"
+authors = [{ name = "Your Team", email = "you@example.com" }]
+readme = "README.md"
+requires-python = ">=3.9"
+
+dependencies = [
+  "pandas>=2.0",
+  "numpy>=1.23",
+  "dart-fss>=0.4.3",
+  "python-dotenv>=1.0",
+  "fastapi>=0.110",
+  "uvicorn>=0.22"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

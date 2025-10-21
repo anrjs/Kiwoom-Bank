@@ -1,2 +1,9 @@
-# Kiwoom-Bank
-KDA 은행 1팀 1차프로젝트
+# kiwoom_finance
+
+Batch financial metrics from DART for credit analysis (bank underwriting).
+
+## Install (dev)
+```bash
+pip install -e .
+
+

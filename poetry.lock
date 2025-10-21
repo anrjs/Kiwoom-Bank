@@ -59,6 +59,14 @@ files = [
     {file = "colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6"},
     {file = "colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44"},
 ]
+[[package]]
+name = "dart-fss"
+version = "0.4.6"
+description = "Financial Supervisory Service DART API wrapper"
+optional = false
+python-versions = ">=3.8"
+groups = ["main"]
+files = []
 
 [[package]]
 name = "fastapi"
@@ -341,4 +349,4 @@ standard = ["colorama (>=0.4) ; sys_platform == \"win32\"", "httptools (>=0.6.3)
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12"
-content-hash = "f20ed8c59ce4dfd73466c27398310ce1f391d1ac8b28ff0711090b0a4ec64027"
+content-hash = "1b2b00021e513eaf07e41ee1aa00fe9df784e0b877e0034ff85f33e4b8d18fab"
