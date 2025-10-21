@@ -1,6 +1,7 @@
 # src/kiwoom_finance/dart_client.py
 from __future__ import annotations
 from typing import Optional
+from functools import lru_cache
 import dart_fss as dart
 from dotenv import load_dotenv, find_dotenv
 import os
@@ -17,8 +18,15 @@ def init_dart(api_key: Optional[str] = None):
         raise RuntimeError("DART_API_KEY is not set. Put it in .env or env var.")
     dart.set_api_key(key)
 
+@lru_cache(maxsize=1)
 def get_corp_list():
+    """Return and cache the global DART corp list."""
     return dart.get_corp_list()
+
+
+def clear_cached_corp_list():
+    """Clear the cached corp list (mainly for tests)."""
+    get_corp_list.cache_clear()
 
 def find_corp(code_or_name: str):
     corps = get_corp_list()

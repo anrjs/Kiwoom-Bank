@@ -4,7 +4,7 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="dart_fss")
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="dart_fss")
 df = get_metrics_for_codes(
-    ['005380', '079550', '023530', '003490', '086520', '004710', '042660', '336260', '001070', '143210', '290120'],
+    ['290120'],
     latest_only=True,
     percent_format=True,
     api_key="66ce66618f4850247aa36d3d0bea34737980af17"   # ← 직접 전달
