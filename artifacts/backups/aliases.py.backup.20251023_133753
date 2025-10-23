@@ -1,0 +1,179 @@
+# src/kiwoom_finance/aliases.py
+
+import re
+import numpy as np
+import pandas as pd
+import calendar
+from typing import List, Optional
+
+# ================================
+# 문자열 정규화 / 기본 유틸
+# ================================
+def _normalize_name(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = re.sub(r"\s+", "", s)
+    s = s.replace(",", "").replace("·", "")
+    s = s.replace("(", "").replace(")", "")
+    s = s.replace("/", "").replace("-", "")
+    return s
+
+def _to_numeric_safe_series(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
+
+# ================================
+# 중복 컬럼 안전 sum
+# ================================
+def _resolve_numeric_series(df: pd.DataFrame, colname: str) -> Optional[pd.Series]:
+    """
+    df 안에서 colname(정규화 기준)과 같은 이름의 컬럼이 여러 개면
+    모두 숫자 변환 후 행합(axis=1)으로 단일 Series를 반환.
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+
+    target_norm = _normalize_name(colname)
+    cols = [c for c in df.columns if _normalize_name(c) == target_norm]
+    if not cols:
+        return None
+
+    sub = df[cols]
+    if isinstance(sub, pd.DataFrame):
+        sub_num = sub.apply(pd.to_numeric, errors="coerce")
+        out = sub_num.sum(axis=1, min_count=1)
+        return out
+    return pd.to_numeric(sub, errors="coerce")
+
+def _sum_all_aliases(df: pd.DataFrame, aliases: List[str]) -> Optional[pd.Series]:
+    """
+    aliases(여러 별칭)과 정규화 기준으로 매칭되는 모든 컬럼을 모아서
+    숫자 변환 후 행합(axis=1)으로 단일 Series 반환.
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty or not aliases:
+        return None
+    alias_norms = { _normalize_name(a) for a in aliases if a is not None }
+    pick_cols = [c for c in df.columns if _normalize_name(c) in alias_norms]
+    if not pick_cols:
+        return None
+    sub = df[pick_cols]
+    sub_num = sub.apply(pd.to_numeric, errors="coerce")
+    out = sub_num.sum(axis=1, min_count=1)
+    return out
+
+# ================================
+# 별칭 사전 (BS/IS/CIS/CF)
+# ================================
+KOR_KEY_ALIASES = {
+    # ===== BS =====
+    "current_assets": ["유동자산", "유동자산총계","유동자산 총계","유동자산총액","유동자산 합계","유동자산계"],
+    "current_liabilities": ["유동부채","유동부채총계","유동부채 총계","유동부채총액","유동부채 합계","유동부채계","단기부채","단기부채총계","단기부채 총계","유동부채합계"],
+    "noncurrent_liabilities": ["비유동부채"],
+    "total_liabilities": ["부채총계", "부채 총계","부채총액","부채 합계","부채계"],
+    "equity_total": ["자본총계", "자본 총계","자본총액","자본 합계","자본계","자본과부채총계"],
+    "equity_parent": ["지배기업소유주지분", "지배기업 소유주지분"],
+    "equity_nci": ["비지배지분"],
+    "total_assets": ["자산총계", "자산 총계", "자산총액","자산 합계","자산계","부채와자본총계","부채와 자본 총계","자산과부채총계"],
+
+    # ===== IS / CIS =====
+    "revenue": [
+        "매출액", "영업수익", "수익", "수익(매출액)", "매출", "매출액(수익)", "판매수익",
+    ],
+    "operating_income": [
+        "영업이익", "영업손익", "영업이익(손실)", "영업(손)익"
+    ],
+    "operating_income_preLLP": ["신용손실충당금전영업이익", "대손충당금전영업이익", "신용손실충당금반영전영업이익"],
+    "credit_loss": ["신용손실충당금전입액", "대손충당금전입액", "대손상각비"],
+    "finance_costs": [
+        "금융비용", "이자비용", "금융원가", "이자비용(손실)", "이자비용및유사비용", "금융비용합계", "이자비용및수수료"
+    ],
+    "net_income": [
+        "당기순이익", "당기순손익", "당기순이익(손실)",
+        "분기순이익", "분기순손익", "반기순이익", "반기순손익",
+        "연결당기순이익", "연결당기순손익",
+        "지배기업의 소유주에게 귀속되는 당기순이익",
+        "지배기업의 소유주에게 귀속되는 당기순이익(손실)",
+        "지배주주지분순이익", "지배주주순이익",
+        "지배기업 소유주지분 순이익"
+    ],
+    "tci_total": [
+        "총포괄손익", "총포괄손익(손실)", "당기총포괄손익",
+        "지배기업의 소유주에게 귀속되는 총포괄손익",
+        "지배기업의 소유주에게 귀속되는 총포괄손익(손실)",
+    ],
+
+    # 금융업 세부(필요시 확장)
+    "interest_income": ["이자이익", "이자수익"],
+    "fee_income": ["수수료이익", "수수료수익"],
+    "insurance_revenue": ["보험료수익", "보험수익"],
+}
+
+# ================================
+# 회전율/차입 등 기타 별칭
+# ================================
+_INVENTORY_ALIASES = ["재고자산", "상품", "제품", "원재료", "재공품"]
+_AR_ALIASES = [
+    "매출채권","외상매출금","장기성매출채권","기타채권","매출채권및기타채권",
+    "유동매출채권","비유동매출채권","단기매출채권","장기매출채권"
+]
+_BORROWINGS_ALIASES = [
+    "단기차입금", "유동성장기부채", "장기차입금", "사채", "리스부채",
+    "기타금융부채", "장기성미지급금", "기타유동부채",  # 표현 변형
+    "유동 차입금(사채 포함)", "유동성사채", "비유동 사채의 비유동성 부분"
+]
+_COGS_ALIASES = ["매출원가"]
+_DA_ALIASES = [
+    "감가상각비", "무형자산상각비", "상각비",
+    "감가상각및무형자산상각비", "감가상각비등",
+    "감가상각비(+)", "무형자산상각비(+)", "상각", "무형자산상각"
+]
+_EBITDA_ALIASES = ["EBITDA", "상각전영업이익"]
+
+# ================================
+# 금융업 판정 키워드
+# ================================
+_FIN_MARKERS = ["대출채권", "보험계약부채", "재보험계약부채", "투자계약부채", "예수부채", "보험계약자산"]
+
+def _is_financial_institution(bs: Optional[pd.DataFrame], cf: Optional[pd.DataFrame]) -> bool:
+    def _norms(df: Optional[pd.DataFrame]):
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return set()
+        return {_normalize_name(c) for c in df.columns}
+    cols = _norms(bs) | _norms(cf)
+    for m in _FIN_MARKERS:
+        if _normalize_name(m) in cols:
+            return True
+    return False
+
+# ================================
+# CF 별칭
+# ================================
+CF_KEY_ALIASES = {
+    # CFO
+    "cfo": [
+        "영업활동현금흐름", "영업활동 현금흐름",
+        "영업으로부터 창출된 현금흐름",
+        "영업활동으로인한현금흐름", "영업활동으로 인한 현금흐름",
+        "영업활동으로 인한 자산·부채의 변동",
+        "영업현금흐름",
+        "영업활동현금흐름(순액)", "영업활동으로부터의현금흐름(순액)", "영업활동으로부터의현금흐름",
+        "영업활동으로부터의순현금흐름", "영업활동현금흐름간접법", "영업활동현금흐름직접법"
+    ],
+    # D&A
+    "da": [
+        "감가상각비", "무형자산상각비", "상각비",
+        "감가상각및무형자산상각", "감가상각비(+)", "무형자산상각비(+)"
+    ],
+    # CapEx (취득 항목 위주)
+    "capex": [
+        "유형자산의 취득", "유형자산의취득",
+        "무형자산의 취득", "무형자산의취득",
+        "투자부동산의 취득", "투자부동산의취득",
+    ],
+}
+
+def _sum_cf_aliases(df: Optional[pd.DataFrame], key: str) -> Optional[pd.Series]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    aliases = CF_KEY_ALIASES.get(key, [])
+    return _sum_all_aliases(df, aliases)
