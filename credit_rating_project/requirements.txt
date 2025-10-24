@@ -1,0 +1,19 @@
+# === 필수 ===
+pandas>=1.3
+numpy>=1.21
+scikit-learn>=1.2
+matplotlib>=3.5
+openpyxl>=3.1
+joblib>=1.2
+
+# === 모델 학습용 ===
+catboost>=1.2.5,<2.0       # 순서형 회귀에 사용
+
+# === 선택적 분석 (예: confusion matrix 개선 등)
+seaborn>=0.11               # (선택) 시각화 고도화 시
+
+# === CLI나 터미널 사용 편의성 (선택)
+tqdm>=4.64                  # (선택) 진행률 표시
+
+# === 한글 시각화 폰트 설정 등 (선택)
+# fonttools>=4.28           # matplotlib 한글폰트 설정 필요 시

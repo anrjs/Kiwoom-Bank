@@ -1,0 +1,15 @@
+[
+  "debt_ratio",
+  "current_ratio",
+  "quick_ratio",
+  "roa",
+  "total_asset_growth_rate",
+  "cfo_to_total_debt",
+  "news_sentiment_score",
+  "news_count",
+  "sentiment_volatility",
+  "positive_ratio",
+  "negative_ratio",
+  "recency_weight_mean",
+  "business_profile_assessment_score"
+]
