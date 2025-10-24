@@ -1,0 +1,204 @@
+# ===============================
+# analyze_colab_fast.py
+# Colab GPU + 캐시 + 배치 FinBERT + 뉴스 피처 추출 (6개)
+# ===============================
+import os, time, html, pickle, requests, torch
+import numpy as np
+import pandas as pd
+from urllib.parse import urlparse
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from openai import OpenAI
+
+# ============ 기본 설정 ============
+COMPANY_COL = "company_name"
+NEWS_PER_PAGE = 30       # Colab 속도 고려 (30건)
+MAX_PAGES = 1
+REQUEST_TIMEOUT = 10
+SLEEP_BETWEEN_CALLS = 0.2
+RECENCY_HALF_LIFE_DAYS = 15
+SOURCE_WEIGHT = {
+    "www.hankyung.com": 1.2,
+    "www.yonhapnews.co.kr": 1.2,
+    "www.mk.co.kr": 1.1,
+}
+FINBERT_MODEL = "yiyanghkust/finbert-tone"
+OPENAI_MODEL = "gpt-4o-mini"
+CACHE_FILE = "translation_cache.pkl"
+
+# ============ 유틸 ============
+def clean_text(t):
+    if not t: return ""
+    return html.unescape(t.replace("<b>", "").replace("</b>", "").strip())
+
+def parse_pubdate(pubdate_str):
+    try:
+        return datetime.strptime(pubdate_str, "%a, %d %b %Y %H:%M:%S %z")
+    except Exception:
+        return datetime.now(timezone.utc)
+
+def recency_weight(pub_dt, now):
+    delta_days = max(0.0, (now - pub_dt).total_seconds() / 86400.0)
+    return 0.5 ** (delta_days / float(RECENCY_HALF_LIFE_DAYS))
+
+def source_weight(host): return SOURCE_WEIGHT.get(host, 1.0)
+
+def build_inputs(items):
+    now = datetime.now(timezone.utc)
+    texts, weights = [], []
+    for it in items:
+        title = clean_text(it.get("title", ""))
+        desc  = clean_text(it.get("description", ""))
+        text = (title + " " + desc).strip()
+        if not text: continue
+        pub = parse_pubdate(it.get("pubDate", ""))
+        w = recency_weight(pub, now) * source_weight(urlparse(it.get("link","")).netloc)
+        texts.append(text); weights.append(w)
+    return texts, weights
+
+def weighted_aggregate(results, weights):
+    if not results: return {"POSITIVE":0.0,"NEGATIVE":0.0,"NEUTRAL":0.0}
+    w = np.clip(np.array(weights if weights else [1.0]*len(results)), 1e-6, None)
+    pos = np.average([r["POSITIVE"] for r in results], weights=w)
+    neg = np.average([r["NEGATIVE"] for r in results], weights=w)
+    neu = np.average([r["NEUTRAL"] for r in results], weights=w)
+    return {"POSITIVE":round(pos,4),"NEGATIVE":round(neg,4),"NEUTRAL":round(neu,4)}
+
+def credit_signal(score):  # (POS-NEG)*100
+    return round(100.0*(score.get("POSITIVE",0)-score.get("NEGATIVE",0)),2)
+
+# ============ 캐시 로드 ============
+if os.path.exists(CACHE_FILE):
+    with open(CACHE_FILE, "rb") as f: translation_cache = pickle.load(f)
+else:
+    translation_cache = {}
+
+def save_cache():
+    with open(CACHE_FILE, "wb") as f: pickle.dump(translation_cache, f)
+
+# ============ 뉴스 수집 ============
+def get_naver_news(query, display=NEWS_PER_PAGE, start=1):
+    headers = {
+        "X-Naver-Client-Id": os.getenv("NAVER_CLIENT_ID",""),
+        "X-Naver-Client-Secret": os.getenv("NAVER_CLIENT_SECRET",""),
+    }
+    params = {"query": query, "display": display, "start": start, "sort": "sim"}
+    r = requests.get("https://openapi.naver.com/v1/search/news.json",
+                     headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json().get("items", [])
+
+def collect_news_for_company(name):
+    all_items = []
+    start = 1
+    for _ in range(MAX_PAGES):
+        items = get_naver_news(f"\"{name}\"", display=NEWS_PER_PAGE, start=start)
+        if not items: break
+        all_items.extend(items)
+        start += NEWS_PER_PAGE
+        time.sleep(SLEEP_BETWEEN_CALLS)
+    # 중복 제거
+    seen, unique = set(), []
+    for it in all_items:
+        title = clean_text(it["title"])
+        host = urlparse(it.get("link","")).netloc
+        if (title,host) in seen: continue
+        seen.add((title,host)); unique.append(it)
+    return unique
+
+# ============ 번역 + 감성 분석 ============
+def init_openai():
+    key = os.getenv("OPENAI_API_KEY")
+    if not key: raise RuntimeError("OPENAI_API_KEY missing")
+    return OpenAI(api_key=key)
+
+def translate_openai(texts, client):
+    out=[]
+    for t in texts:
+        if t in translation_cache: out.append(translation_cache[t]); continue
+        try:
+            resp=client.responses.create(
+                model=OPENAI_MODEL,
+                temperature=0.0,
+                input=[
+                    {"role":"system","content":"Translate Korean financial news headline to English clearly."},
+                    {"role":"user","content":t},
+                ],
+            )
+            eng=resp.output_text.strip()
+            translation_cache[t]=eng; out.append(eng)
+        except Exception as e:
+            print(f"[WARN] translation failed: {e}")
+            out.append(t)
+    save_cache(); return out
+
+# ============ FinBERT GPU 배치 ============
+def init_finbert_batch():
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"FinBERT device: {device}")
+    tokenizer=AutoTokenizer.from_pretrained(FINBERT_MODEL)
+    model=AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL).to(device).eval()
+    return model, tokenizer, device
+
+@torch.no_grad()
+def finbert_scores_batch(texts, model, tokenizer, device, batch_size=16):
+    LABEL={0:"NEGATIVE",1:"NEUTRAL",2:"POSITIVE"}
+    results=[]
+    for i in range(0,len(texts),batch_size):
+        batch=texts[i:i+batch_size]
+        enc=tokenizer(batch,padding=True,truncation=True,max_length=256,return_tensors="pt").to(device)
+        logits=model(**enc).logits
+        probs=torch.nn.functional.softmax(logits,dim=-1).cpu().numpy()
+        for p in probs:
+            results.append({"POSITIVE":float(p[2]),"NEGATIVE":float(p[0]),"NEUTRAL":float(p[1])})
+    return results
+
+# ============ 회사별 뉴스 피처 계산 ============
+def analyze_company(name, client, model, tokenizer, device):
+    items=collect_news_for_company(name)
+    texts,weights=build_inputs(items)
+    if not texts:
+        return {"company":name,"news_sentiment_score":0.0,"news_count":0,
+                "sentiment_volatility":0.0,"positive_ratio":0.0,
+                "negative_ratio":0.0,"recency_weight_mean":0.0}
+    en_texts=translate_openai(texts,client)
+    results=finbert_scores_batch(en_texts,model,tokenizer,device)
+    agg=weighted_aggregate(results,weights)
+    score=credit_signal(agg)
+    diffs=[r["POSITIVE"]-r["NEGATIVE"] for r in results]
+    vol=float(np.std(diffs))
+    pos=sum(1 for r in results if r["POSITIVE"]>max(r["NEGATIVE"],r["NEUTRAL"]))/len(results)
+    neg=sum(1 for r in results if r["NEGATIVE"]>max(r["POSITIVE"],r["NEUTRAL"]))/len(results)
+    avg=float(np.mean(weights))
+    return {
+        "company":name,
+        "news_sentiment_score":round(score,2),
+        "news_count":len(texts),
+        "sentiment_volatility":round(vol,4),
+        "positive_ratio":round(pos,4),
+        "negative_ratio":round(neg,4),
+        "recency_weight_mean":round(avg,4),
+    }
+
+# ============ 메인 ============
+def main():
+    load_dotenv()
+    companies=["리더스코스메틱","리드코프","리튬포어스","마니커","마크로젠","만호제강","매일홀딩스","매커스","머큐리","멀티캠퍼스","메디안디노스틱","메디톡스","메디포스트","메이슨캐피탈","메카로","멕아이씨에스","명문제약","모나리자","모나미","모베이스전자","모비스","모헨즈","무림페이퍼","무학","미래산업","미스터블루","바른손","바이넥스","바이오로그디바이스","바이오스마트","바이오톡스텍","바텍","반도체","방림","버킷스튜디오","범한퓨얼셀","베스파","베셀","보광산업","보령","보라티알","보성파워텍","보해양조","부광약품","부국증권","부산산업","부산주공","부스타","뷰노","브랜드엑스코퍼레이션","브리지텍","블루콤","비나텍","비덴트","비보존헬스케어","비비씨","비상교육","비씨엔씨","비아트론","비엠티","비올","비츠로시스","비츠로테크","비플라이소프트","빛샘전자","빅텍","빅히트","사람인에이치알","삼목에스폼","삼보모터스","삼보산업","삼보판지","삼성공조","삼성머스트스팩6호","삼성바이오로직스","삼성물산","삼성생명","삼성에스디에스","삼성전자","삼성엔지니어링","삼성전기","삼성중공업","삼성증권","삼아알미늄","삼양식품","삼양통상","삼영무역","삼영에스앤씨","삼영엠텍","삼영전자공업","삼영화학","삼원강재","삼익THK","삼익악기","삼일","삼일제약","삼천당제약","삼현","삼호개발","상상인","상상인인더스트리","새로닉스","샘씨엔에스","샘표","서남","서린바이오","서부T&D","서울식품","서울옥션","서울전자통신","서울제약","서원","서연","서플러스글로벌","서한","선광","선도전기","성광벤드","성문전자","성보화학","성신양회","성우하이텍","성창기업지주","성화이텍","세기상사","세명전기","세방","세방전지","세아제강지주","세아특수강","세아홀딩스","세운메디칼","세원","세원물산","세이브존I&C","세종공업","세진중공업","세화피앤씨","센트랄모텍","셀리드","셀바스AI","셀트리온","셀트리온제약","소리바다","솔루엠","솔브레인홀딩스","솔본","솔트룩스","송원산업","쇼박스","수산아이앤티","수산인더스트리","수성이노베이션","스맥","스카이이앤엠","스킨앤스킨","스타모빌리티","스타플렉스","스튜디오드래곤","스튜디오미르","승일","시노펙스","신라에스지","신라젠","신세계","신세계건설","신세계인터내셔날","신송홀딩스","신신제약","신성이엔지","신영와코루","신원","신원종합개발","신일전자","신진에스엠","신풍제약","신화실업","신화인터텍","신흥","심텍","쌍방울","쌍용정보통신","쌍용차","씨아이에스","씨에스베어링","씨엔플러스","씨유메디칼","씨티케이","아난티","아남전자","아모그린텍","아모레퍼시픽","아모텍","아바코","아비코전자","아세아제지","아세아텍","아센디오","아스트","아시아나항공","아진산업","아톤","아트라스BX","아이디스","아이마켓코리아","아이씨디","아이쓰리시스템","아이앤씨","아이오케이","아이원스","아이원아이앤씨","아이진","아이컴포넌트","아이크래프트","아이텍","아이티센","아이피에스","아주IB투자","아주스틸","알루코","알에스오토메이션","알엔투테크놀로지","알톤스포츠","애경산업","애경케미칼","액션스퀘어","액토즈소프트","앤씨앤","앱클론","야스","어보브반도체","에넥스","에브리봇","에스디바이오센서","에스맥","에스에이엠티","에스에프에이","에스엔유","에스엘","에스엠","에스엠코어","에스와이","에스제이그룹","에스제이엠","에스티팜","에스폴리텍","에스피시스템스","에스피지","에이디칩스","에이비엘바이오","에이비프로바이오","에이스침대","에이치엘비","에이치엠씨투자증권","에코마케팅","에코프로","에코프로비엠","에코프로에이치엔","엑사이엔씨","엑셈","엑시콘","엔바이오니아","엔비티","엔씨소프트","엔에스","엔에이치엔","엔오씨","엔켐","엔투텍","엔피","엘앤에프","엘오티베큠","엘컴텍","엠게임","엠로","엠벤처투자","엠씨넥스","엠투아이","엠플러스","영보화학","영풍정밀","영화금속","영화테크","예림당","오리엔트바이오","오리엔트정공","오리콤","오상자이엘","오성첨단소재","오션브릿지","오이솔루션","오케이이엔지","오텍","오픈베이스","옵티시스","와이지엔터테인먼트","와이솔","와이오엠","와이제이엠게임즈","와이팜","우리금융지주","우리넷","우리산업","우리산업홀딩스","우리이앤엘","우림피티에스","우수AMS","웅진","웅진씽크빅","원익","원익IPS","원익큐브","원익홀딩스","원익QnC","원익피앤이","원일특강","원풍물산","위더스제약","위닉스","위메이드","윈스","유니드","유니온","유니온머티리얼","유니온커뮤니티","유니켐","유니퀘스트","유라테크","유비쿼스","유비쿼스홀딩스","유성기업","유신","유아이엘","유안타증권","유양디앤유","유유제약","유진기업","유진테크","유테크","유투바이오","유한양행","유화증권","유후", "현대자동차", "LIG넥스원", "롯데쇼핑", "대한항공", "한솔테크닉스", "한화오션", "두산퓨얼셀", "대한방직", "핸즈코퍼레이션", "디에이치오토리드"]
+
+    client=init_openai()
+    model,tokenizer,device=init_finbert_batch()
+
+    records=[]
+    for name in companies:
+        print(f"\n=== {name} 분석 시작 ===")
+        feats=analyze_company(name,client,model,tokenizer,device)
+        records.append(feats)
+        print(f"완료 → {feats}")
+
+    df=pd.DataFrame(records)
+    df.to_csv("news_features.csv",index=False,encoding="utf-8-sig")
+    print("\n✅ 모든 기업 분석 완료 → news_features.csv 저장됨")
+
+if __name__=="__main__":
+    main()
