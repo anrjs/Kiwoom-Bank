@@ -11,13 +11,13 @@ NICE 신용평가 - 병렬 검색 크롤러(캐시 + 리트라이 강화)
 # 필요 패키지
 # pip install selenium webdriver-manager beautifulsoup4 requests pandas
 
-
 import os
 import re
 import time
 import math
 import unicodedata
 import threading
+import argparse
 from datetime import datetime
 from difflib import SequenceMatcher
 from urllib.parse import urlparse, parse_qs, quote_plus
@@ -726,15 +726,75 @@ def save_dataframe(df: pd.DataFrame, suffix="parallel_cache") -> str:
 def chunk_by_size(lst: list, size: int) -> list[list]:
     return [lst[i:i+size] for i in range(0, len(lst), size)]
 
-def main():
+# 추가: 프로그래밍 호출용 함수 (리스트 입력받아 실행하고 결과 반환)
+def crawl_companies(companies: list[str]) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+    """
+    companies: list of company names (strings)
+    returns: (df_final, skipped_all)
+    """
     # 0) 디스크 캐시 로드 (한 번만)
     global DISK_CACHE
     DISK_CACHE = _load_disk_cache()
     print(f"💾 디스크 캐시 로드 완료: by_name={len(DISK_CACHE['by_name'])}, by_req={len(DISK_CACHE['by_req'])}")
 
-    companies = load_companies_from_txt()
     if not companies:
-        print("⚠ companies.txt가 비어있거나 경로가 잘못되었습니다.")
+        raise ValueError("입력된 회사 리스트가 비어있습니다.")
+
+    print(f"📋 대상 검색어 수: {len(companies)}")
+
+    driver_path = ChromeDriverManager().install()
+
+    # ---- 1라운드: 병렬 처리 ----
+    if BATCH_SIZE_AUTO:
+        size = max(1, math.ceil(len(companies) / MAX_WORKERS))
+    else:
+        size = 40
+    batches = chunk_by_size(companies, size)
+    print(f"🧵 워커 수: {MAX_WORKERS}, 배치 {len(batches)}개, 배치 크기 ≈ {size}")
+
+    rows_all, skipped_all = [], []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futs = {ex.submit(worker_process, batch, idx+1, driver_path): idx+1
+                for idx, batch in enumerate(batches)}
+        for fut in as_completed(futs):
+            wid = futs[fut]
+            try:
+                res = fut.result()
+                rows_all.extend(res["rows"])
+                skipped_all.extend(res["skipped"])
+                print(f"[W{wid}] ✅ 완료: rows={len(res['rows'])}, skipped={len(res['skipped'])}")
+            except Exception as e:
+                print(f"[W{wid}] ❗ 워커 예외: {e}")
+
+    # ---- 2라운드: 최종 리트라이(선택) ----
+    if FINAL_RETRY:
+        failed_names = [name for name, why in skipped_all if why in ("검색 실패", "결과 없음")]
+        failed_names = list(dict.fromkeys(failed_names))  # 중복 제거, 순서 보존
+        if failed_names:
+            rows_retry, skipped_retry = retry_failed_serial(failed_names, driver_path)
+            rows_all.extend(rows_retry)
+            # 최종 스킵 갱신
+            skipped_all = [(n, w) for (n, w) in skipped_all if n not in failed_names] + skipped_retry
+
+    # rows_all: 앞 단계에서 수집한 원시 결과 (list[dict])
+    df_final = build_two_column_df(companies, rows_all)
+    return df_final, skipped_all
+
+def main():
+    # argparse로 터미널 입력 수신; 입력 없으면 기존 companies.txt 사용(기존 동작 유지)
+    parser = argparse.ArgumentParser(description="NICE 회사채등급 크롤러 - 회사명을 인자로 넘기거나, 입력 없으면 companies.txt 사용")
+    parser.add_argument("companies", nargs="*", help="회사명들 공백으로 구분하여 입력 (예: 삼성전자 SK하이닉스)")
+    args = parser.parse_args()
+    companies = args.companies if args.companies else load_companies_from_txt()
+
+    # 0) 디스크 캐시 로드 (한 번만)
+    global DISK_CACHE
+    DISK_CACHE = _load_disk_cache()
+    print(f"💾 디스크 캐시 로드 완료: by_name={len(DISK_CACHE['by_name'])}, by_req={len(DISK_CACHE['by_req'])}")
+
+    if not companies:
+        print("⚠ companies.txt가 비어있거나 경로가 잘못되었으며, 터미널 입력도 제공되지 않았습니다.")
         return
     print(f"📋 대상 검색어 수: {len(companies)}")
 
@@ -773,7 +833,6 @@ def main():
             # 최종 스킵 갱신
             skipped_all = [(n, w) for (n, w) in skipped_all if n not in failed_names] + skipped_retry
 
-        # ---- 결과 저장 (요청기업명 + 등급 2열) ----
     # rows_all: 앞 단계에서 수집한 원시 결과 (list[dict])
     df_final = build_two_column_df(companies, rows_all)
 

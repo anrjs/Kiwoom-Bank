@@ -1,0 +1,24 @@
+# === Core ===
+python-dotenv>=1.0.1
+requests>=2.32.3
+numpy>=1.26.4
+pandas>=2.2.3
+scikit-learn>=1.5.2
+
+# === NLP & Transformers ===
+torch>=2.6.0        # (.bin 체크포인트 로드 위해 2.6+ 필수, CPU OK)
+transformers>=4.45.2
+accelerate>=0.34.2
+huggingface_hub>=0.26.2
+
+# === OpenAI ===
+openai>=1.51.0      # Responses API 포함 (GPT 번역용)
+
+# === Web / API (선택적으로 FastAPI 연동할 경우) ===
+fastapi>=0.115.0
+uvicorn>=0.32.0
+
+# === Optional (분석/시각화/로깅) ===
+tqdm>=4.67.0
+matplotlib>=3.9.2
+seaborn>=0.13.2
