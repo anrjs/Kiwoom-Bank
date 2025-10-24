@@ -19,6 +19,9 @@ dependencies = [
   "uvicorn>=0.22"
 ]
 
+[project.scripts]
+kiwoom-dart-batch = "kiwoom_finance.batch_runner.dart_batch:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
