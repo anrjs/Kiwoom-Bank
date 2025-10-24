@@ -1,6 +1,7 @@
 # src/kiwoom_finance/batch.py
 from __future__ import annotations
 
+import os
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, TimeoutError
@@ -16,7 +17,7 @@ import pandas as pd
 from tqdm import tqdm
 
 # 내부 모듈
-from .dart_client import extract_fs, find_corp, init_dart
+from .dart_client import extract_fs, find_corp, init_dart, IdentifierType
 from .preprocess import preprocess_all
 from .metrics import compute_metrics_df_flat_kor
 
@@ -40,6 +41,105 @@ DEFAULT_COLS = [
 ]
 
 
+# ======================================
+# 캐시/출력 유틸 (안전 동작 보장용 헬퍼)
+# ======================================
+
+def _resolve_output_dir_safely(output_dir: str | Path) -> Path:
+    """
+    안전하게 출력 디렉터리를 반환.
+    - 만약 같은 경로에 '파일'이 존재하면 '_dir'을 덧붙인 디렉터리로 우회 생성
+    """
+    p = Path(output_dir)
+    if p.exists() and p.is_file():
+        p = p.with_name(p.name + "_dir")
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _load_cached_csv(code: str, output_dir_path: Path) -> pd.DataFrame | None:
+    """
+    과거 저장한 CSV(코드별 1개)를 읽어서 DataFrame 반환. 없거나 실패 시 None.
+    """
+    csv_path = output_dir_path / f"{code}.csv"
+    if not csv_path.exists():
+        return None
+    try:
+        df = pd.read_csv(csv_path, index_col=0, encoding="utf-8-sig")
+        return df
+    except Exception:
+        return None
+
+
+def _resolve_cache_dir(cache_dir: str | Path | None) -> Path | None:
+    """
+    피클 캐시 루트 경로 반환. None이면 비활성.
+    """
+    if cache_dir is None:
+        return None
+    root = Path(cache_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _build_cache_key(
+    *,
+    code: str,
+    bgn_de: str,
+    report_tp: str,
+    separate: bool,
+    latest_only: bool,
+    percent_format: bool,
+) -> str:
+    """
+    파라미터 조합을 바탕으로 안정적인 캐시 키 생성
+    """
+    payload = {
+        "code": code,
+        "bgn_de": bgn_de,
+        "report_tp": report_tp,
+        "separate": separate,
+        "latest_only": latest_only,
+        "percent_format": percent_format,
+        # 향후 옵션 추가 대비
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _load_cached_frame(cache_root: Path, cache_key: str, ttl_seconds: float | None) -> pd.DataFrame | None:
+    """
+    캐시 파일 읽기. TTL(초) 내면 반환, 초과면 None.
+    """
+    pkl_path = cache_root / f"{cache_key}.pkl"
+    if not pkl_path.exists():
+        return None
+    try:
+        if ttl_seconds is not None and ttl_seconds > 0:
+            age = time.time() - os.stat(pkl_path).st_mtime
+            if age > ttl_seconds:
+                return None
+        return pd.read_pickle(pkl_path)
+    except Exception:
+        return None
+
+
+def _store_cached_frame(cache_root: Path, cache_key: str, df: pd.DataFrame) -> None:
+    """
+    캐시 파일 저장
+    """
+    pkl_path = cache_root / f"{cache_key}.pkl"
+    try:
+        df.to_pickle(pkl_path)
+    except Exception:
+        # 캐시 실패는 치명 아님
+        pass
+
+
+# -----------------------
+# 워커/품질/후보 컬럼 선택
+# -----------------------
+
 @dataclass
 class WorkerConfig:
     bgn_de: str
@@ -52,10 +152,32 @@ class WorkerConfig:
     throttle_sec: float = 1.2  # DART 부하 방지용 sleep (1.0 -> 1.2)
 
 
-def _select_existing_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """DEFAULT_COLS 중 실제 존재하는 것만 추려서 반환"""
+@dataclass
+class LookupTarget:
+    identifier: str
+    stock_code: str
+    corp_name: str | None = None
+
+    @property
+    def label(self) -> str:
+        base = self.corp_name or self.identifier
+        return f"{base}({self.stock_code})"
+
+
+def _normalize_stock_code(raw: str | int | None) -> str | None:
+    if raw is None:
+        return None
+    code = str(raw).strip()
+    if not code:
+        return None
+    if code.isdigit() and len(code) < 6:
+        code = code.zfill(6)
+    return code
+
+
+def _select_existing_cols(df):
     keep = [c for c in DEFAULT_COLS if c in df.columns]
-    return df[keep].copy() if keep else pd.DataFrame(index=df.index)
+    return df[keep].copy() if keep else df.copy()   # ← 없으면 원본 유지
 
 
 def _try_extract_with_fallback(corp, cfg: WorkerConfig):
@@ -77,157 +199,22 @@ def _try_extract_with_fallback(corp, cfg: WorkerConfig):
             is_nfc = True
         elif "NotFoundConsolidated" in f"{type(e)} {e}":  # 문자열 판별(보조)
             is_nfc = True
-
         if is_nfc:
-            alt = not cfg.separate
-            tqdm.write(
-                f"🔁 [{getattr(corp, 'stock_code', '???')}] "
-                f"{'연결' if cfg.separate else '별도'} 재무 미발견 → "
-                f"{'별도' if alt else '연결'} 재무로 재시도"
-            )
+            # 반대 separate로 재시도
             return extract_fs(
                 corp,
                 bgn_de=cfg.bgn_de,
                 report_tp=cfg.report_tp,
-                separate=alt,
+                separate=not cfg.separate,
             )
-        raise  # 기타 예외는 상위 재시도 대상으로
-
-
-# =============
-# 품질/캐시 헬퍼
-# =============
-def _resolve_output_dir_safely(output_dir: str) -> Path:
-    """
-    - 상대경로를 절대경로로 강제
-    - 조상 경로 중 '파일'이 끼어 있으면 자동으로 *_output 으로 우회
-    - 최종 경로가 파일이면 *_dir 로 우회
-    - 그래도 실패하면 .kiwoom_out/<원래마지막폴더> 로 폴백
-    """
-    def _abs(p: Path) -> Path:
-        return p if p.is_absolute() else (Path.cwd() / p)
-
-    try:
-        p = _abs(Path(output_dir))
-
-        # 1) 조상 경로 검사 (루트→부모 순서)
-        ancestors = list(p.parents)[::-1]  # 루트에 가까운 것부터
-        for anc in ancestors:
-            if anc.exists() and not anc.is_dir():
-                alt_anc = Path(str(anc) + "_output")
-                rel = p.relative_to(anc)
-                p = alt_anc / rel
-                tqdm.write(f"⚠️ 조상 경로가 파일입니다: '{anc}' → '{alt_anc}'로 우회합니다.")
-                break
-
-        # 2) 최종 경로가 파일이면 *_dir로 우회
-        if p.exists() and not p.is_dir():
-            alt_p = Path(str(p) + "_dir")
-            tqdm.write(f"⚠️ 출력 경로가 파일입니다: '{p}' → '{alt_p}'로 우회합니다.")
-            p = alt_p
-
-        # 3) 디렉터리 생성
-        p.mkdir(parents=True, exist_ok=True)
-        tqdm.write(f"📁 출력 경로: {p}")
-        return p
-
-    except Exception as e:
-        # 4) 최종 폴백
-        try:
-            last = Path(output_dir).name or "by_stock"
-            fallback = Path.cwd() / ".kiwoom_out" / last
-            fallback.mkdir(parents=True, exist_ok=True)
-            tqdm.write(f"⚠️ 경로 생성 실패({type(e).__name__}): '{output_dir}' → 폴백 '{fallback}' 사용")
-            return fallback
-        except Exception as e2:
-            cwd = Path.cwd()
-            tqdm.write(f"❗ 폴백도 실패({type(e2).__name__}). 현재 경로 사용: '{cwd}'")
-            return cwd
-
-
-def _resolve_cache_dir(cache_dir: str | Path | None) -> Path | None:
-    if cache_dir is None:
-        return None
-    cache_root = Path(cache_dir).expanduser()
-    cache_root.mkdir(parents=True, exist_ok=True)
-    return cache_root
-
-def _build_cache_key(
-    code: str,
-    bgn_de: str,
-    report_tp: str,
-    separate: bool,
-    latest_only: bool,
-    percent_format: bool,
-) -> str:
-    safe_code = re.sub(r"[^0-9A-Za-z]+", "_", code).strip("_") or "code"
-    payload = {
-        "code": code,
-        "bgn_de": bgn_de,
-        "report_tp": report_tp,
-        "separate": separate,
-        "latest_only": latest_only,
-        "percent_format": percent_format,
-    }
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
-    return f"{safe_code}_{digest}"
-
-def build_cache_key_public(**kwargs) -> str:
-    """외부 도구/스크립트에서 캐시 키가 필요할 때 사용하세요."""
-    return _build_cache_key(**kwargs)
-
-def _cache_file_path(cache_root: Path, cache_key: str) -> Path:
-    return cache_root / f"{cache_key}.pkl"
-
-def _load_cached_frame(
-    cache_root: Path,
-    cache_key: str,
-    ttl_seconds: float | None,
-) -> pd.DataFrame | None:
-    cache_path = _cache_file_path(cache_root, cache_key)
-    if not cache_path.exists():
-        return None
-    if ttl_seconds is not None:
-        age = time.time() - cache_path.stat().st_mtime
-        if age > ttl_seconds:
-            return None
-    try:
-        cached = pd.read_pickle(cache_path)
-    except Exception:
-        return None
-    if not isinstance(cached, pd.DataFrame):
-        return None
-    return cached
-
-def _store_cached_frame(cache_root: Path, cache_key: str, df: pd.DataFrame) -> None:
-    cache_path = _cache_file_path(cache_root, cache_key)
-    tmp_path = cache_path.parent / f"{cache_path.name}.tmp"
-    df.to_pickle(tmp_path)
-    tmp_path.replace(cache_path)
-
-def _load_cached_csv(code: str, output_dir_path: Path) -> pd.DataFrame | None:
-    """by_stock/<code>.csv 최신본 읽기 시도 + 숫자 캐스팅"""
-    csv_path = output_dir_path / f"{code}.csv"
-    if not csv_path.exists():
-        return None
-    try:
-        # 인덱스/문자 보존
-        df = pd.read_csv(csv_path, index_col=0, dtype=str)
-        if df is None or df.empty:
-            return None
-        # 숫자 칼럼만 다시 float로 캐스팅
-        num_cols = [c for c in df.columns if c != "stock_code"]
-        df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
-        return df
-    except Exception:
-        return None
+        raise
 
 
 def _quality_ok(df: pd.DataFrame, nan_ratio_limit: float, min_non_null: int) -> bool:
     """
-    숫자형으로 해석 가능한 열을 기준으로 가장 '잘 채워진' 행을 보며
-    NaN 비율이 임계값 이하이고, 최소 채워진 열 수를 만족하면 통과.
+    결과 품질 판정:
+    - NaN 비율이 허용치 이하
+    - 단일 행 기준 채워진(숫자) 지표 개수 ≥ min_non_null
     """
     if df is None or df.empty:
         return False
@@ -253,7 +240,7 @@ def _quality_ok(df: pd.DataFrame, nan_ratio_limit: float, min_non_null: int) -> 
 # ============
 # 워커 (단일 종목)
 # ============
-def _run_worker(code: str, cfg: WorkerConfig) -> pd.DataFrame | None:
+def _run_worker(code: str, cfg: WorkerConfig, identifier: str | None = None) -> pd.DataFrame | None:
     """
     개별 종목 처리:
     - (멀티프로세스 호환) 워커 내부에서 DART 초기화
@@ -264,14 +251,18 @@ def _run_worker(code: str, cfg: WorkerConfig) -> pd.DataFrame | None:
     # 프로세스/스레드 어디서든 안전하게 초기화
     init_dart(cfg.api_key)
 
+    label = identifier or code
+
     for attempt in range(1, cfg.retries + 1):
         try:
             # 부하 방지
             time.sleep(cfg.throttle_sec)
 
-            corp = find_corp(code)
+            corp = find_corp(code, by="code")
             if corp is None:
-                raise ValueError(f"corp not found for {code}")
+                raise ValueError(f"corp not found for {label}")
+
+            corp_code = _normalize_stock_code(getattr(corp, "stock_code", None)) or code
 
             # FS 추출(연결→별도 폴백 내장)
             fs = _try_extract_with_fallback(corp, cfg)
@@ -286,25 +277,27 @@ def _run_worker(code: str, cfg: WorkerConfig) -> pd.DataFrame | None:
             df = _select_existing_cols(df)
 
             if df.empty:
-                tqdm.write(f"⚠️ [{code}] 데이터 없음 (빈 DataFrame)")
+                tqdm.write(f"⚠️ [{label}] 데이터 없음 (빈 DataFrame)")
                 return None
 
             # 최신 1개만
             if cfg.latest_only:
                 df = df.sort_index(ascending=False).iloc[[0]]
-                df.index = [code]
+                df.index = [corp_code]
             else:
-                df.index = [f"{code}_{i}" for i in range(len(df))]
+                df.index = [f"{corp_code}_{i}" for i in range(len(df))]
 
             df.index.name = "stock_code"
             return df
 
         except Exception as e:
-            tqdm.write(f"⚠️ [{code}] 시도 {attempt}/{cfg.retries} 실패: {type(e).__name__}: {e}")
+            tqdm.write(
+                f"⚠️ [{label}] 시도 {attempt}/{cfg.retries} 실패: {type(e).__name__}: {e}"
+            )
             traceback.print_exc(limit=1)  # 스택 추적 과다 출력 방지
             time.sleep(0.9 * attempt)     # 지수 백오프(소폭 상향)
 
-    tqdm.write(f"❌ [{code}] {cfg.retries}회 실패 후 건너뜀.")
+    tqdm.write(f"❌ [{label}] {cfg.retries}회 실패 후 건너뜀.")
     return None
 
 
@@ -318,6 +311,7 @@ def get_metrics_for_codes(
     separate: bool = True,
     latest_only: bool = False,
     percent_format: bool = False,  # 현재 숫자형 유지 기본
+    identifier_type: IdentifierType = "auto",
     api_key: Optional[str] = None,
     max_workers: int = 6,
     save_each: bool = False,
@@ -339,16 +333,20 @@ def get_metrics_for_codes(
     - 품질 필터로 NaN 과다 종목 스킵 가능
     - 종목별 하드 타임아웃
     - Windows 기본 ThreadPool 사용(멀티프로세스는 __main__ 보호 필요)
+    - identifier_type="auto"(기본)면 종목명을 우선 검색 후 종목코드를 시도
     """
     if not codes:
         return pd.DataFrame(columns=DEFAULT_COLS)
+
+    # 이름 검색을 위해 메인 프로세스에서도 초기화(api_key 우선 적용)
+    init_dart(api_key)
 
     # 🔧 안전한 디렉터리 생성 (artifacts가 파일이어도 우회)
     output_dir_path = _resolve_output_dir_safely(output_dir)
 
     frames: list[pd.DataFrame] = []
-    failed: list[str] = []
-    skipped: list[tuple[str, str]] = []  # (code, reason)
+    failed: list[tuple[str, str | None, str]] = []  # (identifier, stock_code, reason)
+    skipped: list[tuple[str, str | None, str]] = []
 
     cfg = WorkerConfig(
         bgn_de=bgn_de,
@@ -361,37 +359,64 @@ def get_metrics_for_codes(
         throttle_sec=1.2,
     )
 
+    # 0) 입력 식별자 → 실제 종목코드 매핑
+    targets: list[LookupTarget] = []
+    for raw in codes:
+        if raw is None:
+            continue
+        identifier = str(raw).strip()
+        if not identifier:
+            continue
+
+        corp = find_corp(identifier, by=identifier_type)
+        if corp is None:
+            failed.append((identifier, None, "not_found"))
+            tqdm.write(f"❌ [{identifier}] 종목을 찾을 수 없습니다.")
+            continue
+
+        stock_code = _normalize_stock_code(getattr(corp, "stock_code", None))
+        if not stock_code:
+            failed.append((identifier, None, "no_stock_code"))
+            tqdm.write(f"❌ [{identifier}] 종목코드를 확인할 수 없습니다.")
+            continue
+
+        corp_name = getattr(corp, "corp_name", None)
+        if corp_name is not None:
+            corp_name = str(corp_name).strip() or None
+
+        targets.append(LookupTarget(identifier=identifier, stock_code=stock_code, corp_name=corp_name))
+
     # ===== 피클 캐시 우선 조회 =====
     cache_root = _resolve_cache_dir(cache_dir)
     ttl_seconds = float(cache_ttl) if cache_ttl is not None else None
 
     # 제출 대상 결정: CSV 캐시 → 피클 캐시 → API
-    submit_codes: list[str] = []
+    submit_targets: list[LookupTarget] = []
 
     # 1) CSV 캐시 체크 (하위 호환)
     if save_each:
-        for code in codes:
-            csv_df = _load_cached_csv(code, output_dir_path)
+        for target in targets:
+            csv_df = _load_cached_csv(target.stock_code, output_dir_path)
             if csv_df is not None:
                 if (not skip_nan_heavy) or _quality_ok(csv_df, nan_ratio_limit, min_non_null):
                     frames.append(csv_df)
-                    tqdm.write(f"✅ [CSV 캐시 사용] {code}")
+                    tqdm.write(f"✅ [CSV 캐시 사용] {target.label}")
                     continue
                 else:
-                    tqdm.write(f"⚠️ [CSV 캐시 품질불량] {code} → 재시도 예정")
-            submit_codes.append(code)
+                    tqdm.write(f"⚠️ [CSV 캐시 품질불량] {target.label} → 재시도 예정")
+            submit_targets.append(target)
     else:
-        submit_codes = list(codes)
+        submit_targets = list(targets)
 
     # 2) 피클 캐시 체크
-    frames_ordered: list[pd.DataFrame | None] = [None] * len(submit_codes)
+    frames_ordered: list[pd.DataFrame | None] = [None] * len(submit_targets)
     cache_keys: dict[int, str] = {}
-    codes_to_fetch: list[tuple[int, str]] = []
+    targets_to_fetch: list[tuple[int, LookupTarget]] = []
 
     if cache_root is not None:
-        for idx, code in enumerate(submit_codes):
+        for idx, target in enumerate(submit_targets):
             ck = _build_cache_key(
-                code=code,
+                code=target.stock_code,
                 bgn_de=bgn_de,
                 report_tp=report_tp,
                 separate=separate,
@@ -404,16 +429,16 @@ def get_metrics_for_codes(
                 if cached_df is not None:
                     if (not skip_nan_heavy) or _quality_ok(cached_df, nan_ratio_limit, min_non_null):
                         frames_ordered[idx] = cached_df
-                        tqdm.write(f"✅ [피클 캐시 히트] {code}")
+                        tqdm.write(f"✅ [피클 캐시 히트] {target.label}")
                         continue
                     else:
-                        tqdm.write(f"⚠️ [피클 캐시 품질불량] {code} → 재시도 예정")
-            codes_to_fetch.append((idx, code))
+                        tqdm.write(f"⚠️ [피클 캐시 품질불량] {target.label} → 재시도 예정")
+            targets_to_fetch.append((idx, target))
     else:
-        codes_to_fetch = list(enumerate(submit_codes))
+        targets_to_fetch = list(enumerate(submit_targets))
 
     # 3) API 병렬 처리
-    def _submit_and_collect(to_fetch: list[tuple[int, str]]):
+    def _submit_and_collect(to_fetch: list[tuple[int, LookupTarget]]):
         if not to_fetch:
             return
 
@@ -421,12 +446,12 @@ def get_metrics_for_codes(
 
         with Executor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(_run_worker, code, cfg): (idx, code)
-                for idx, code in to_fetch
+                executor.submit(_run_worker, target.stock_code, cfg, target.identifier): (idx, target)
+                for idx, target in to_fetch
             }
             pbar = tqdm(total=len(futures), desc="📊 종목 처리 중", ncols=100, dynamic_ncols=False)
             for future in as_completed(futures):
-                idx, code = futures[future]
+                idx, target = futures[future]
                 try:
                     if per_code_timeout_sec and per_code_timeout_sec > 0:
                         df = future.result(timeout=per_code_timeout_sec)
@@ -436,41 +461,47 @@ def get_metrics_for_codes(
                     if df is not None and not df.empty:
                         # 품질 필터
                         if skip_nan_heavy and not _quality_ok(df, nan_ratio_limit, min_non_null):
-                            skipped.append((code, "nan_heavy"))
-                            tqdm.write(f"⏭️  [{code}] NaN 과다로 스킵")
+                            skipped.append((target.identifier, target.stock_code, "nan_heavy"))
+                            tqdm.write(f"⏭️  [{target.label}] NaN 과다로 스킵")
                         else:
                             frames_ordered[idx] = df
                             # 피클 캐시 저장
                             if cache_root is not None:
-                                _store_cached_frame(cache_root, cache_keys[idx], df)
+                                ck = cache_keys.get(idx)
+                                if ck:
+                                    _store_cached_frame(cache_root, ck, df)
                             # CSV 캐시 저장(옵션)
                             if save_each:
-                                (output_dir_path / f"{code}.csv").parent.mkdir(parents=True, exist_ok=True)
-                                df.to_csv(output_dir_path / f"{code}.csv", encoding="utf-8-sig")
+                                out_path = output_dir_path / f"{target.stock_code}.csv"
+                                out_path.parent.mkdir(parents=True, exist_ok=True)
+                                df.to_csv(out_path, encoding="utf-8-sig")
                     else:
-                        failed.append(code)
+                        failed.append((target.identifier, target.stock_code, "empty"))
                 except TimeoutError:
-                    failed.append(code)
-                    tqdm.write(f"⏱️  [{code}] 타임아웃({per_code_timeout_sec}s)으로 실패 처리")
+                    failed.append((target.identifier, target.stock_code, "timeout"))
+                    tqdm.write(f"⏱️  [{target.label}] 타임아웃({per_code_timeout_sec}s)으로 실패 처리")
                 except Exception as e:
-                    tqdm.write(f"❌ [{code}] 예외 발생: {type(e).__name__}: {e}")
-                    failed.append(code)
+                    tqdm.write(f"❌ [{target.label}] 예외 발생: {type(e).__name__}: {e}")
+                    failed.append((target.identifier, target.stock_code, type(e).__name__))
                 finally:
                     pbar.update(1)
             pbar.close()
 
-    _submit_and_collect(codes_to_fetch)
+    _submit_and_collect(targets_to_fetch)
 
     # 실패/스킵 목록 저장
     report_dir = _resolve_output_dir_safely("artifacts")
     if failed:
         fail_path = report_dir / "failed_codes.csv"
-        pd.DataFrame({"failed_code": failed}).to_csv(fail_path, index=False, encoding="utf-8-sig")
-        print(f"\n⚠️ 실패한 종목 {len(failed)}개 → {fail_path} 저장됨")
+        fail_df = pd.DataFrame(failed, columns=["identifier", "stock_code", "reason"])
+        fail_df["failed_code"] = fail_df["stock_code"].fillna(fail_df["identifier"])
+        fail_df.to_csv(fail_path, index=False, encoding="utf-8-sig")
+        print(f"\n⚠️ 실패한 종목 {len(fail_df)}개 → {fail_path} 저장됨")
     if skipped:
         skip_path = report_dir / "skipped_codes.csv"
-        pd.DataFrame(skipped, columns=["code", "reason"]).to_csv(skip_path, index=False, encoding="utf-8-sig")
-        print(f"ℹ️ 스킵된 종목 {len(skipped)}개 → {skip_path} 저장됨")
+        skip_df = pd.DataFrame(skipped, columns=["identifier", "stock_code", "reason"])
+        skip_df.to_csv(skip_path, index=False, encoding="utf-8-sig")
+        print(f"ℹ️ 스킵된 종목 {len(skip_df)}개 → {skip_path} 저장됨")
 
     # 결과 병합
     from_cache = [f for f in frames_ordered if f is not None]
