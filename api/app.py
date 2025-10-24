@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Tuple
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
 from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ★ DART 재무
@@ -38,6 +39,13 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
 
 app = FastAPI(title="Kiwoom Financial Metrics API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 서버 시작 시 DART 초기화(+선택: FinBERT 워밍업)
@@ -166,3 +174,4 @@ def debug_find(q: str, mode: IdentifierType = "auto"):
         "corp_code": getattr(c, "corp_code", None),
         "stock_code": getattr(c, "stock_code", None),
     }
+q
