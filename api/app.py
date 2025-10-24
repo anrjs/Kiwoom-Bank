@@ -16,6 +16,10 @@ import os
 
 from kiwoom_finance.batch import get_metrics_for_codes
 from kiwoom_finance.dart_client import IdentifierType, init_dart, find_corp
+from kiwoom_finance.services.company_summary import (
+    SUMMARY_METRICS,
+    get_company_summaries,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # .env (프로젝트 루트) 명시 로드
@@ -40,6 +44,28 @@ class MetricsResponse(BaseModel):
     data: list
 
 
+class SummaryMetricsPayload(BaseModel):
+    operating_margin: float | None = None
+    net_profit_margin: float | None = None
+    roe: float | None = None
+    roa: float | None = None
+    sales_growth_rate: float | None = None
+    operating_income_growth_rate: float | None = None
+
+
+class CompanySummaryItem(BaseModel):
+    identifier: str
+    stock_code: str | None = None
+    corp_name: str | None = None
+    metrics: SummaryMetricsPayload | None = None
+    credit_rating: str | None = None
+    error: str | None = None
+
+
+class CompanySummaryResponse(BaseModel):
+    data: List[CompanySummaryItem]
+
+
 @app.get("/metrics", response_model=MetricsResponse)
 def metrics(
     identifiers: List[str] = Query(
@@ -60,6 +86,44 @@ def metrics(
         identifier_type=search_mode,
     )
     return {"data": df.reset_index().to_dict(orient="records")}
+
+
+@app.get("/company/summary", response_model=CompanySummaryResponse)
+async def company_summary(
+    identifiers: List[str] = Query(
+        ..., alias="codes", description="종목명 또는 종목코드"
+    ),
+    search_mode: IdentifierType = Query(
+        "auto", description="검색 모드(auto|name|code)"
+    ),
+    percent_format: bool = True,
+):
+    summaries = await get_company_summaries(
+        identifiers,
+        search_mode=search_mode,
+        percent_format=percent_format,
+    )
+
+    items: list[CompanySummaryItem] = []
+    for summary in summaries:
+        metrics_payload = None
+        if summary.metrics is not None:
+            metrics_payload = SummaryMetricsPayload(
+                **{metric: summary.metrics.get(metric) for metric in SUMMARY_METRICS}
+            )
+
+        items.append(
+            CompanySummaryItem(
+                identifier=summary.identifier,
+                stock_code=summary.stock_code,
+                corp_name=summary.corp_name,
+                metrics=metrics_payload,
+                credit_rating=summary.credit_rating,
+                error=summary.error,
+            )
+        )
+
+    return CompanySummaryResponse(data=items)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
