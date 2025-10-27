@@ -119,6 +119,9 @@ def weighted_aggregate(per_item: List[Dict[str, float]], weights: List[float]) -
         acc[k] = acc[k] / wsum
     # 재정규화 안전장치
     s = sum(acc.values()) or 1.0
-    for k in acc:
+    for k in list(acc.keys()):
         acc[k] = acc[k] / s
+        acc["positive_ratio"] = acc.get("POSITIVE", 0.0)
+        acc["negative_ratio"] = acc.get("NEGATIVE", 0.0)
+        acc["neutral_ratio"] = acc.get("NEUTRAL", 0.0)
     return acc

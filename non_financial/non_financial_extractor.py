@@ -19,8 +19,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import pandas as pd
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 import dart_fss as dart
+import warnings
+
+# XML을 HTML로 파싱할 때 뜨는 경고 억제(실제 XML은 _soup에서 XML 파서로 처리)
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 # ----------------------------
 # Configuration
@@ -94,6 +98,18 @@ def _safe_div(a: Optional[float], b: Optional[float]) -> Optional[float]:
     if a is None or b in (None, 0):
         return None
     return a / b
+
+# ----------------------------
+# HTML/XML soup helper
+# ----------------------------
+
+def _soup(text: str) -> BeautifulSoup:
+    """
+    입력 텍스트가 XML(XBRL 포함)로 보이면 lxml-xml 파서,
+    아니면 HTML 파서를 자동 선택합니다.
+    """
+    parser = "lxml-xml" if re.search(r"<\?xml|<xbrl", text, re.IGNORECASE) else "lxml"
+    return BeautifulSoup(text, parser)
 
 # ----------------------------
 # Corp lookup
@@ -426,7 +442,7 @@ def _clean_segment_df(df: pd.DataFrame, unit_mul: float) -> Optional[pd.DataFram
     return work
 
 def compute_portfolio_from_text(text: str) -> Tuple[Optional[int], Optional[float], Optional[float]]:
-    soup = BeautifulSoup(text, "lxml")
+    soup = _soup(text)
     tables = soup.find_all("table")
     if not tables:
         return None, None, None
@@ -435,7 +451,7 @@ def compute_portfolio_from_text(text: str) -> Tuple[Optional[int], Optional[floa
     for tbl in tables_sorted[:15]:
         unit_mul = _parse_unit_from_caption_or_nearby(tbl)
         try:
-            dfs = pd.read_html(str(tbl), flavor="lxml")
+            dfs = pd.read_html(io.StringIO(str(tbl)), flavor="lxml")
         except Exception:
             continue
         for df in dfs:
@@ -463,7 +479,7 @@ COMMERCE_KWS  = ["커머스","Commerce","쇼핑","리테일","스토어","마켓
 FINTECH_KWS   = ["페이","Pay","결제","송금","지급","금융","대출","보험","증권"]
 
 def _extract_best_segment_df(text: str) -> Optional[pd.DataFrame]:
-    soup = BeautifulSoup(text, "lxml")
+    soup = _soup(text)
     tables = soup.find_all("table")
     if not tables:
         return None
@@ -544,12 +560,12 @@ def get_business_portfolio(corp_code: str, bsns_year: int) -> Tuple[Optional[int
 # ----------------------------
 
 def _all_tables_from_text(text: str):
-    soup = BeautifulSoup(text, "lxml")
+    soup = _soup(text)
     return soup.find_all("table")
 
 def _dfs_from_table(tbl):
     try:
-        return pd.read_html(str(tbl), flavor="lxml")
+        return pd.read_html(io.StringIO(str(tbl)), flavor="lxml")
     except Exception:
         return []
 
@@ -1308,12 +1324,6 @@ def _parse_mixed_korean_amount(fragment: str) -> Optional[float]:
     return total if total > 0 else None
 
 # ---- Backlog (건설/조선/방산) ----
-
-def _dfs_from_table(tbl):
-    try:
-        return pd.read_html(str(tbl), flavor="lxml")
-    except Exception:
-        return []
 
 BACKLOG_ROW_KWS = [
     "수주", "잔고", "잔량", "수주잔고", "수주 잔고", "수주잔액", "수주잔량",

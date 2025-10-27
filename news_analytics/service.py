@@ -2,14 +2,17 @@
 from __future__ import annotations
 import os
 import time
+import math
 from datetime import datetime, timedelta, timezone
+from statistics import fmean
 from typing import Any, Dict, List, Optional, Tuple
+
 from news_analytics import config
 
 from . import naver_news
 from . import preprocess
 from .sentiment_finbert import analyze_texts_ko, weighted_aggregate
-from .utils_scoring import credit_signal
+from .utils_scoring import credit_signal, normalize_weights, weighted_stddev
 
 KST = timezone(timedelta(hours=9))
 
@@ -96,15 +99,55 @@ def analyze_news_for_query(
 
     # 가중(최근일수록 더 큰 가중)
     weights = _recency_weights(news)
+    weights_for_stats = weights if weights and len(weights) == len(per_item_scores) else [1.0] * len(per_item_scores)
+
+    if per_item_scores and len(weights) != len(per_item_scores):
+        weights_for_stats = [1.0] * len(per_item_scores)
+    else:
+        weights_for_stats = weights
+
+    normalized_weights = normalize_weights(weights_for_stats)
+    recency_weight_mean = fmean(weights_for_stats) if weights_for_stats else 0.0
+
     agg = weighted_aggregate(per_item_scores, weights)
+
+    sentiment_scores: List[float] = []
+    for dist in per_item_scores[:len(weights_for_stats)]:
+        pos = float(dist.get("POSITIVE", dist.get("positive_ratio", 0.0)))
+        neg = float(dist.get("NEGATIVE", dist.get("negative_ratio", 0.0)))
+        sentiment_scores.append(pos - neg)
+
+    sentiment_volatility = (
+        weighted_stddev(sentiment_scores, normalized_weights)
+        if sentiment_scores and normalized_weights
+        else 0.0
+    )
 
     # 크레딧 신호 점수로 변환(네 utils_scoring 규칙)
     score = credit_signal(agg)
 
+    positive_ratio = (
+        agg.get("positive_ratio") if isinstance(agg, dict) else None
+    )
+    if positive_ratio is None:
+        positive_ratio = float(agg.get("POSITIVE", 0.0))
+
+    negative_ratio = (
+        agg.get("negative_ratio") if isinstance(agg, dict) else None
+    )
+    if negative_ratio is None:
+        negative_ratio = float(agg.get("NEGATIVE", 0.0))
+
     return {
         "query": query,
         "count": len(news),
+        "news_count": len(news),
         "aggregate": agg,            # {"POSITIVE":0.x, "NEGATIVE":0.x, "NEUTRAL":0.x}
-        "credit_score": score,       # float (예: (pos-neg)*100)
+        "credit_score": score,
+        "news_sentiment_score": score,
+        "positive_ratio": positive_ratio,
+        "negative_ratio": negative_ratio,
+        "recency_weight_mean": recency_weight_mean,
+        "sentiment_volatility": sentiment_volatility,     # float (예: (pos-neg)*100)
         "items": news,               # 원문 항목들(제목/링크/언론사/게시시각 등)
     }

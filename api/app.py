@@ -1,3 +1,4 @@
+# api/app.py
 import sys
 import asyncio
 import os
@@ -6,43 +7,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Body, HTTPException
 from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# ★ DART 재무
-from kiwoom_finance.batch import get_metrics_for_codes
-from kiwoom_finance.dart_client import IdentifierType, find_corp, init_dart
 
-# ★ nice_rating 크롤러(wrapper)
-from nice_rating import crawler as nice_crawler
-
-# ★ 뉴스 감성분석 서비스
-from news_analytics.service import analyze_news_for_query
-
-# ★ 비재무(공시기반) 스코어
-from non_financial import extract_non_financial_core
-from non_financial.industry_credit_model import evaluate_company, classify_industry
-
-from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Kiwoom Financial Metrics API")
 
-# ⬇️ 프론트 도메인/포트에 맞춰 수정하세요. (개발 중엔 "*"도 가능)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://<프론트PC-IP>:3000",
-        "http://<프론트-도메인>",    # 배포 시
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ──────────────────────────────────────────────────────────────
 if sys.platform.startswith("win"):
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -52,24 +33,30 @@ if sys.platform.startswith("win"):
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
 
-# ──────────────────────────────────────────────────────────────
+# ── internal imports ──────────────────────────────────────────
+from kiwoom_finance.batch import get_metrics_for_codes
+from kiwoom_finance.dart_client import IdentifierType, find_corp, init_dart
+from nice_rating import crawler as nice_crawler
+from news_analytics.service import analyze_news_for_query
+from non_financial import extract_non_financial_core
+from non_financial.industry_credit_model import evaluate_company, classify_industry
+
+from api.features import router as features_router, FeaturePayload, save_features as _save_features
+app.include_router(features_router)  # /features/*
+
 @app.on_event("startup")
 def _startup():
     init_dart()
-    # FinBERT warm-up (선택)
     try:
         import news_analytics.sentiment_finbert as _warm
         _ = getattr(_warm, "MODEL_READY", True)
         print("✅ FinBERT ready.")
     except Exception as e:
         print("⚠️ FinBERT warm-up skipped:", e)
-
     print("🔑 DART_API_KEY prefix:", (os.getenv("DART_API_KEY") or "")[:6])
     print("✅ DART ready.")
 
-# ──────────────────────────────────────────────────────────────
-# Models
-# ──────────────────────────────────────────────────────────────
+# ── models ────────────────────────────────────────────────────
 class CompanySummaryItem(BaseModel):
     query: str
     stock_code: str | None = None
@@ -89,16 +76,19 @@ class MetricsResponse(BaseModel):
 
 class NewsSentimentItem(BaseModel):
     query: str
-    count: int
+    news_count: int
     aggregate: Dict[str, float]
-    credit_score: float
+    news_sentiment_score: float
+    sentiment_volatility: float
+    positive_ratio: float
+    negative_ratio: float
+    recency_weight_mean: float
     items: List[Dict[str, Any]]
 
 class NewsSentimentResponse(BaseModel):
     results: List[NewsSentimentItem]
     meta: Dict[str, Any]
 
-# ★ 비재무
 class NonFinancialCoreItem(BaseModel):
     company: str
     core: Dict[str, Any]
@@ -109,7 +99,7 @@ class NonFinancialResponse(BaseModel):
     results: List[NonFinancialCoreItem]
     meta: Dict[str, Any]
 
-# ──────────────────────────────────────────────────────────────
+# ── utils ─────────────────────────────────────────────────────
 async def _crawl_credit_ratings_async(queries: List[str]) -> Tuple[Dict[str, str], List[Tuple[str, str]]]:
     loop = asyncio.get_running_loop()
     def _run():
@@ -123,7 +113,7 @@ async def _crawl_credit_ratings_async(queries: List[str]) -> Tuple[Dict[str, str
         return mapping, skipped
     return await loop.run_in_executor(None, _run)
 
-# ──────────────────────────────────────────────────────────────
+# ── endpoints ─────────────────────────────────────────────────
 @app.get("/metrics", response_model=MetricsResponse)
 def metrics(
     identifiers: List[str] = Query(..., alias="codes"),
@@ -139,7 +129,6 @@ def metrics(
     )
     return {"data": df.reset_index().to_dict(orient="records")}
 
-# ──────────────────────────────────────────────────────────────
 @app.get("/credit/ratings")
 async def credit_ratings(
     identifiers: List[str] = Query(..., alias="codes")
@@ -152,7 +141,19 @@ async def credit_ratings(
         "meta": {"ts": datetime.utcnow().isoformat() + "Z"},
     }
 
-# ──────────────────────────────────────────────────────────────
+@app.post("/credit")
+async def credit_ratings_alias(payload: Dict[str, Any] = Body(...)):
+    queries = payload.get("queries") or []
+    if not isinstance(queries, list) or not queries:
+        raise HTTPException(status_code=400, detail="queries must be a non-empty list")
+    ratings_by_query, skipped = await _crawl_credit_ratings_async(queries)
+    return {
+        "queries": queries,
+        "ratings": ratings_by_query,
+        "skipped": [{"query": q, "why": why} for (q, why) in skipped],
+        "meta": {"ts": datetime.utcnow().isoformat() + "Z"},
+    }
+
 @app.get("/news/sentiment", response_model=NewsSentimentResponse)
 async def news_sentiment(
     identifiers: List[str] = Query(..., alias="codes"),
@@ -167,23 +168,15 @@ async def news_sentiment(
         results.append(NewsSentimentItem(**data))
     return NewsSentimentResponse(
         results=results,
-        meta={
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-            "limit": limit,
-            "days": days,
-            "model": "FinBERT + OpenAI translate",
-        },
+        meta={"generated_at": datetime.utcnow().isoformat() + "Z", "limit": limit, "days": days, "model": "FinBERT + OpenAI translate"},
     )
 
-# ──────────────────────────────────────────────────────────────
-# ★ 신규: 비재무(공시기반) 코어 & 스코어
-# ──────────────────────────────────────────────────────────────
 @app.get("/credit/nonfinancial", response_model=NonFinancialResponse)
 async def non_financial(
-    identifiers: List[str] = Query(..., alias="companies", description="회사명 리스트"),
-    year: int | None = Query(None, description="사업연도(미입력시 직전년도)"),
-    industry_override: str | None = Query(None, description="산업 수동 지정(선택)"),
-    include_score: bool = Query(True, description="점수/등급 계산 포함 여부"),
+    identifiers: List[str] = Query(..., alias="companies"),
+    year: int | None = Query(None),
+    industry_override: str | None = Query(None),
+    include_score: bool = Query(True),
 ):
     out: List[NonFinancialCoreItem] = []
     for name in identifiers:
@@ -191,22 +184,39 @@ async def non_financial(
             core = await run_in_threadpool(extract_non_financial_core, name, year, industry_override)
             item = NonFinancialCoreItem(company=name, core=core)
             if include_score and core.get("corp_code"):
-                # 모델 입력값 구성
                 model_inputs = {k: core.get(k) for k in core.keys()}
-                res = await run_in_threadpool(
-                    evaluate_company, name, model_inputs, industry_override, None, industry_override
-                )
+                res = await run_in_threadpool(evaluate_company, name, model_inputs, industry_override, None, industry_override)
                 item.score = res
             out.append(item)
         except Exception as e:
             out.append(NonFinancialCoreItem(company=name, core={}, error=str(e)))
 
-    return NonFinancialResponse(
-        results=out,
-        meta={"ts": datetime.utcnow().isoformat() + "Z", "year": year, "include_score": include_score}
-    )
+    return NonFinancialResponse(results=out, meta={"ts": datetime.utcnow().isoformat() + "Z", "year": year, "include_score": include_score})
 
-# ──────────────────────────────────────────────────────────────
+@app.get("/nonfinancial", response_model=NonFinancialResponse)
+async def non_financial_alias(
+    company: str = Query(...),
+    include_score: bool = Query(True),
+    year: int | None = Query(None),
+    industry_override: str | None = Query(None),
+):
+    return await non_financial(identifiers=[company], year=year, industry_override=industry_override, include_score=include_score)
+
+@app.post("/analyze")
+async def analyze_stub(payload: Dict[str, Any] = Body(...)):
+    name = (payload or {}).get("company_name")
+    if not name:
+        raise HTTPException(status_code=400, detail="company_name is required")
+    ratings_by_query, _ = await _crawl_credit_ratings_async([name])
+    grade = ratings_by_query.get(name, "N/A")
+    return {"predicted_grade": grade, "updated_at": datetime.utcnow().isoformat() + "Z"}
+
+# 프론트 호환: POST /comp_features  → 내부 /features/save 사용
+@app.post("/comp_features")
+def comp_features_alias(payload: FeaturePayload):
+    print("➡️ [/comp_features] 프론트 호환 호출")
+    return _save_features(payload)
+
 @app.get("/_debug/find")
 def debug_find(q: str, mode: IdentifierType = "auto"):
     c = find_corp(q, by=mode)
