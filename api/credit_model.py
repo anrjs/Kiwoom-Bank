@@ -1,3 +1,4 @@
+# api/credit_model.py
 """Utilities to run the credit rating model on stored feature CSVs."""
 from __future__ import annotations
 
@@ -11,7 +12,24 @@ import joblib
 import numpy as np
 import pandas as pd
 
-# NOTE: ``api`` is a namespace package, so this works without __init__.py.
+import sys, types
+from pathlib import Path
+
+_CREDIT_ROOT = Path(__file__).resolve().parents[1] / "credit_rating_project"
+SRC_DIR = (_CREDIT_ROOT / "src").resolve()
+
+# 1) sys.path에 src 디렉토리 추가
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+# 2) 'src' 패키지 이름을 강제로 등록 (src/__init__.py 없어도 import 가능하게)
+if "src" not in sys.modules:
+    src_pkg = types.ModuleType("src")
+    src_pkg.__path__ = [str(SRC_DIR)]
+    sys.modules["src"] = src_pkg
+# --- end shim ---
+
+# features 저장 폴더 공유
 from api.features import SAVE_DIR as FEATURES_DIR  # type: ignore
 
 _CREDIT_ROOT = Path(__file__).resolve().parents[1] / "credit_rating_project"
@@ -20,12 +38,10 @@ _CONFIG_PATH = _CREDIT_ROOT / "src" / "config.py"
 if not _CONFIG_PATH.exists():
     raise RuntimeError(f"Credit rating config not found: {_CONFIG_PATH}")
 
-
 @lru_cache(maxsize=1)
 def _load_config_module():
     """Dynamically load the credit rating config module."""
     import importlib.util
-
     spec = importlib.util.spec_from_file_location("credit_config", _CONFIG_PATH)
     if spec is None or spec.loader is None:
         raise ImportError(f"Unable to load credit rating config from {_CONFIG_PATH}")
@@ -33,13 +49,11 @@ def _load_config_module():
     spec.loader.exec_module(module)  # type: ignore[misc]
     return module
 
-
 def _get_config_attr(name: str):
     module = _load_config_module()
     if not hasattr(module, name):
         raise AttributeError(f"credit_config missing attribute '{name}'")
     return getattr(module, name)
-
 
 FEATURE_COLS: List[str] = list(_get_config_attr("FEATURE_COLS"))
 NUMERIC_PERCENT_COLS: List[str] = list(_get_config_attr("NUMERIC_PERCENT_COLS"))
@@ -47,10 +61,8 @@ _ARTIFACTS_DIR = (_CREDIT_ROOT / _get_config_attr("ARTIFACTS_DIR")).resolve()
 _MODEL_BUNDLE_PATH = _ARTIFACTS_DIR / "model.joblib"
 _LABEL_MAPPING_PATH = _ARTIFACTS_DIR / "label_mapping.json"
 
-
 class CreditModelNotReady(RuntimeError):
     """Raised when the credit model artifacts are missing."""
-
 
 def _to_float_from_percent(value: Any) -> Optional[float]:
     """Convert value that may contain percent strings into float."""
@@ -64,18 +76,17 @@ def _to_float_from_percent(value: Any) -> Optional[float]:
             text = text[:-1]
             try:
                 return float(text) / 100.0
-            except ValueError as exc:  # pragma: no cover - safety guard
+            except ValueError as exc:
                 raise ValueError(f"Cannot parse percent value: {value!r}") from exc
         try:
             return float(text)
-        except ValueError as exc:  # pragma: no cover - safety guard
+        except ValueError as exc:
             raise ValueError(f"Cannot parse numeric value: {value!r}") from exc
     if isinstance(value, (int, float, np.floating)):
         if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
             return None
         return float(value)
     return float(value)
-
 
 def _prepare_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     working = df.copy()
@@ -85,16 +96,15 @@ def _prepare_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         if col in working.columns:
             working[col] = working[col].map(_to_float_from_percent)
 
-    # 누락 컬럼을 NaN으로 만들어서 파이프라인(Imputer)이 처리하도록
+    # 누락 컬럼을 NaN으로 채워서 파이프라인(Imputer)이 처리하도록
     missing = [col for col in FEATURE_COLS if col not in working.columns]
     if missing:
         print(f"[credit_model] ⚠️ CSV에 누락된 컬럼: {missing}")
         for col in missing:
-            working[col] = np.nan  # Imputer 없다면 0.0 등으로
+            working[col] = np.nan  # SimpleImputer가 있으면 채워짐
 
-    # 최종 컬럼 순서 고정
+    # 컬럼 순서 고정
     return working[FEATURE_COLS].copy()
-
 
 @lru_cache(maxsize=1)
 def _load_model_bundle():
@@ -115,10 +125,8 @@ def _load_model_bundle():
 
     return bundle["preprocessor"], bundle["model"], id2label
 
-
 def _sanitize_company_name(company: str) -> str:
     return company.replace("/", "_").replace("\\", "_")
-
 
 def find_latest_feature_file(company: str) -> Optional[Path]:
     safe = _sanitize_company_name(company)
@@ -126,7 +134,6 @@ def find_latest_feature_file(company: str) -> Optional[Path]:
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
-
 
 def load_feature_rows(path: Path) -> pd.DataFrame:
     if not path.exists():
@@ -136,16 +143,15 @@ def load_feature_rows(path: Path) -> pd.DataFrame:
     df = df.reset_index().rename(columns={"index": "company"})
     return df
 
-
 def predict_from_dataframe(df: pd.DataFrame) -> List[Dict[str, Any]]:
     if df.empty:
         return []
-
     preprocessor, model, id2label = _load_model_bundle()
     X = _prepare_feature_frame(df)
     X_transformed = preprocessor.transform(X)
     y_pred_reg = model.predict(X_transformed)
     y_pred_notch = np.clip(np.round(y_pred_reg), 0, len(id2label) - 1).astype(int)
+
     results: List[Dict[str, Any]] = []
 
     company_series: Optional[pd.Series] = None
@@ -162,6 +168,7 @@ def predict_from_dataframe(df: pd.DataFrame) -> List[Dict[str, Any]]:
             raw_name = company_series.iloc[idx]
             if not pd.isna(raw_name):
                 company_name = str(raw_name)
+
         features_dict: Dict[str, Optional[float]] = {}
         for col in FEATURE_COLS:
             value = X.iloc[idx][col]
@@ -169,11 +176,13 @@ def predict_from_dataframe(df: pd.DataFrame) -> List[Dict[str, Any]]:
                 features_dict[col] = None
             else:
                 features_dict[col] = float(value)
+
         actual_label: Optional[str] = None
         if label_series is not None:
             value = label_series.iloc[idx]
             if not pd.isna(value):
                 actual_label = str(value)
+
         results.append(
             {
                 "company": company_name,
@@ -186,20 +195,23 @@ def predict_from_dataframe(df: pd.DataFrame) -> List[Dict[str, Any]]:
         )
     return results
 
-
 def predict_for_company(company: str) -> Dict[str, Any]:
     feature_file = find_latest_feature_file(company)
     if feature_file is None:
         raise FileNotFoundError(f"No feature CSV found for '{company}' in {FEATURES_DIR}")
 
     df = load_feature_rows(feature_file)
+
+    # 같은 회사명 로우만 추출 가능하면 추출
     if "company" in df.columns:
         mask = df["company"].astype(str).str.lower() == company.lower()
         if mask.any():
             df = df.loc[mask].copy()
+
     predictions = predict_from_dataframe(df)
     if not predictions:
         raise RuntimeError(f"No predictions generated for '{company}'")
+
     prediction = predictions[0]
     prediction.setdefault("company", company)
     prediction["source_file"] = str(feature_file)

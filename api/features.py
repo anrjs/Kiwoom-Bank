@@ -5,12 +5,12 @@ from pathlib import Path
 from datetime import datetime
 import pandas as pd
 
-# /features로 시작하는 하위 라우터
+# /features 로 시작하는 서브 라우터
 router = APIRouter(prefix="/features", tags=["features"])
 
-# 프로젝트 루트(kiwoombank) 기준 경로 계산
-PROJECT_ROOT = Path(__file__).resolve().parents[1]  # .../kiwoombank
-SAVE_DIR = PROJECT_ROOT / "comp_features"           # .../kiwoombank/comp_features
+# 프로젝트 루트(…/kiwoombank) 기준 저장 폴더
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SAVE_DIR = PROJECT_ROOT / "comp_features"
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 class FeaturePayload(BaseModel):
@@ -32,7 +32,6 @@ class FeaturePayload(BaseModel):
 
 @router.get("/ping")
 def ping():
-    """저장 경로/파일 리스트 간단 확인용"""
     files = sorted([p.name for p in SAVE_DIR.glob("*.csv")])
     return {
         "ok": True,
@@ -45,11 +44,7 @@ def ping():
 
 @router.get("/list")
 def list_files():
-    """CSV 목록 반환"""
-    items = [
-        {"name": p.name, "path": str(p)}
-        for p in sorted(SAVE_DIR.glob("*.csv"))
-    ]
+    items = [{"name": p.name, "path": str(p)} for p in sorted(SAVE_DIR.glob("*.csv"))]
     return {"ok": True, "dir": str(SAVE_DIR), "items": items}
 
 @router.post("/save")
@@ -76,6 +71,7 @@ def save_features(payload: FeaturePayload):
             "public_credit_rating": payload.public_credit_rating,
         }
         df = pd.DataFrame([row], index=[payload.company])
+        # 컬럼 순서 고정 (모델과 동일)
         df = df[
             [
                 "debt_ratio",

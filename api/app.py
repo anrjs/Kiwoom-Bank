@@ -12,10 +12,14 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-
+# NaN/inf JSON 직렬화 보강
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
+import numpy as np
 
 app = FastAPI(title="Kiwoom Financial Metrics API")
 
+# CORS (개발 편의용 전체 허용)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,6 +28,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Windows 이벤트 루프 정책
 if sys.platform.startswith("win"):
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -33,21 +38,27 @@ if sys.platform.startswith("win"):
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
 
-# ── internal imports ──────────────────────────────────────────
+# ── 내부 모듈 ────────────────────────────────────────────────
 from kiwoom_finance.batch import get_metrics_for_codes
 from kiwoom_finance.dart_client import IdentifierType, find_corp, init_dart
 from nice_rating import crawler as nice_crawler
 from news_analytics.service import analyze_news_for_query
 from non_financial import extract_non_financial_core
-from non_financial.industry_credit_model import evaluate_company, classify_industry
+from non_financial.industry_credit_model import evaluate_company
 
 from api.features import router as features_router, FeaturePayload, save_features as _save_features
 from api.credit_model import (
     predict_for_company,
     CreditModelNotReady,
+    find_latest_feature_file,
+    load_feature_rows,
+    FEATURE_COLS,
 )
-app.include_router(features_router)  # /features/*
 
+# /features/* 라우터 등록
+app.include_router(features_router)
+
+# ── Startup ──────────────────────────────────────────────────
 @app.on_event("startup")
 def _startup():
     init_dart()
@@ -60,7 +71,7 @@ def _startup():
     print("🔑 DART_API_KEY prefix:", (os.getenv("DART_API_KEY") or "")[:6])
     print("✅ DART ready.")
 
-# ── models ────────────────────────────────────────────────────
+# ── Pydantic 모델 ────────────────────────────────────────────
 class CompanySummaryItem(BaseModel):
     query: str
     stock_code: str | None = None
@@ -103,7 +114,7 @@ class NonFinancialResponse(BaseModel):
     results: List[NonFinancialCoreItem]
     meta: Dict[str, Any]
 
-# ── utils ─────────────────────────────────────────────────────
+# ── 공용 유틸 ────────────────────────────────────────────────
 async def _crawl_credit_ratings_async(queries: List[str]) -> Tuple[Dict[str, str], List[Tuple[str, str]]]:
     loop = asyncio.get_running_loop()
     def _run():
@@ -117,7 +128,7 @@ async def _crawl_credit_ratings_async(queries: List[str]) -> Tuple[Dict[str, str
         return mapping, skipped
     return await loop.run_in_executor(None, _run)
 
-# ── endpoints ─────────────────────────────────────────────────
+# ── 엔드포인트 ────────────────────────────────────────────────
 @app.get("/metrics", response_model=MetricsResponse)
 def metrics(
     identifiers: List[str] = Query(..., alias="codes"),
@@ -134,9 +145,7 @@ def metrics(
     return {"data": df.reset_index().to_dict(orient="records")}
 
 @app.get("/credit/ratings")
-async def credit_ratings(
-    identifiers: List[str] = Query(..., alias="codes")
-):
+async def credit_ratings(identifiers: List[str] = Query(..., alias="codes")):
     ratings_by_query, skipped = await _crawl_credit_ratings_async(identifiers)
     return {
         "queries": identifiers,
@@ -145,6 +154,7 @@ async def credit_ratings(
         "meta": {"ts": datetime.utcnow().isoformat() + "Z"},
     }
 
+# 프런트 호환 POST /credit
 @app.post("/credit")
 async def credit_ratings_alias(payload: Dict[str, Any] = Body(...)):
     queries = payload.get("queries") or []
@@ -165,9 +175,8 @@ async def news_sentiment(
     limit: int = 20,
     days: int = 3,
 ):
-    queries = identifiers
     results: List[NewsSentimentItem] = []
-    for q in queries:
+    for q in identifiers:
         data = await run_in_threadpool(analyze_news_for_query, q, limit, days)
         results.append(NewsSentimentItem(**data))
     return NewsSentimentResponse(
@@ -194,9 +203,12 @@ async def non_financial(
             out.append(item)
         except Exception as e:
             out.append(NonFinancialCoreItem(company=name, core={}, error=str(e)))
+    return NonFinancialResponse(
+        results=out,
+        meta={"ts": datetime.utcnow().isoformat() + "Z", "year": year, "include_score": include_score}
+    )
 
-    return NonFinancialResponse(results=out, meta={"ts": datetime.utcnow().isoformat() + "Z", "year": year, "include_score": include_score})
-
+# 프런트 호환 GET /nonfinancial?company=...
 @app.get("/nonfinancial", response_model=NonFinancialResponse)
 async def non_financial_alias(
     company: str = Query(...),
@@ -204,40 +216,35 @@ async def non_financial_alias(
     year: int | None = Query(None),
     industry_override: str | None = Query(None),
 ):
-    return await non_financial(identifiers=[company], year=year, industry_override=industry_override, include_score=include_score)
+    return await non_financial([company], year, industry_override, include_score)
 
-
+# ACI 등급 추론 (모델 기반)
 @app.post("/analyze")
 async def analyze_credit(payload: Dict[str, Any] = Body(...)):
     name = (payload or {}).get("company_name")
     if not name:
         raise HTTPException(status_code=400, detail="company_name is required")
-
     try:
         prediction = await run_in_threadpool(predict_for_company, name)
     except FileNotFoundError as exc:
-        # CSV 자체가 없는 경우
         raise HTTPException(status_code=404, detail=str(exc))
     except CreditModelNotReady as exc:
-        # model.joblib, label_mapping.json 없을 때
         raise HTTPException(status_code=503, detail=str(exc))
     except ValueError as exc:
-        # 컬럼 불일치/파싱 오류 등 사용자가 조치 가능한 문제
         raise HTTPException(status_code=422, detail=f"invalid features: {exc}")
     except Exception as exc:
-        # 마지막 안전망: 원인 표시
         raise HTTPException(status_code=500, detail=f"credit analysis failed: {exc}")
-
     prediction.setdefault("company", name)
     prediction["updated_at"] = datetime.utcnow().isoformat() + "Z"
     return prediction
 
-# 프론트 호환: POST /comp_features  → 내부 /features/save 사용
+# 프런트 호환: POST /comp_features → 내부 /features/save 사용
 @app.post("/comp_features")
 def comp_features_alias(payload: FeaturePayload):
     print("➡️ [/comp_features] 프론트 호환 호출")
     return _save_features(payload)
 
+# 디버그: 종목 찾기
 @app.get("/_debug/find")
 def debug_find(q: str, mode: IdentifierType = "auto"):
     c = find_corp(q, by=mode)
@@ -250,19 +257,21 @@ def debug_find(q: str, mode: IdentifierType = "auto"):
         "stock_code": getattr(c, "stock_code", None),
     }
 
-from api.credit_model import find_latest_feature_file, load_feature_rows, FEATURE_COLS
-
+# 진단 엔드포인트 (NaN-safe JSON)
 @app.get("/analyze/diag")
 def analyze_diagnose(company: str):
     p = find_latest_feature_file(company)
     if not p:
         raise HTTPException(status_code=404, detail=f"No feature CSV found for '{company}'")
     df = load_feature_rows(p)
-    return {
+    # NaN/inf/-inf → None 치환
+    df = df.replace([np.nan, np.inf, -np.inf], None)
+    payload = {
         "company": company,
         "file": str(p),
-        "shape": df.shape,
+        "shape": list(df.shape),
         "columns": list(df.columns),
         "required_FEATURE_COLS": FEATURE_COLS,
-        "head": df.head(3).to_dict(orient="records"),
+        "head": df.head(5).to_dict(orient="records"),
     }
+    return JSONResponse(content=jsonable_encoder(payload))
