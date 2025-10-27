@@ -15,7 +15,7 @@ import pandas as pd
 
 from kiwoom_finance.batch import get_metrics_for_codes
 
-DEFAULT_CODES = ["005930"]
+DEFAULT_CODES = ["SK하이닉스"]
 
 
 @dataclass(slots=True)
