@@ -42,6 +42,10 @@ from non_financial import extract_non_financial_core
 from non_financial.industry_credit_model import evaluate_company, classify_industry
 
 from api.features import router as features_router, FeaturePayload, save_features as _save_features
+from api.credit_model import (
+    predict_for_company,
+    CreditModelNotReady,
+)
 app.include_router(features_router)  # /features/*
 
 @app.on_event("startup")
@@ -203,13 +207,23 @@ async def non_financial_alias(
     return await non_financial(identifiers=[company], year=year, industry_override=industry_override, include_score=include_score)
 
 @app.post("/analyze")
-async def analyze_stub(payload: Dict[str, Any] = Body(...)):
+async def analyze_credit(payload: Dict[str, Any] = Body(...)):
     name = (payload or {}).get("company_name")
     if not name:
         raise HTTPException(status_code=400, detail="company_name is required")
-    ratings_by_query, _ = await _crawl_credit_ratings_async([name])
-    grade = ratings_by_query.get(name, "N/A")
-    return {"predicted_grade": grade, "updated_at": datetime.utcnow().isoformat() + "Z"}
+    
+    try:
+        prediction = await run_in_threadpool(predict_for_company, name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except CreditModelNotReady as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:  # pragma: no cover - defensive guard
+        raise HTTPException(status_code=500, detail=f"credit analysis failed: {exc}")
+
+    prediction.setdefault("company", name)
+    prediction["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    return prediction
 
 # 프론트 호환: POST /comp_features  → 내부 /features/save 사용
 @app.post("/comp_features")
