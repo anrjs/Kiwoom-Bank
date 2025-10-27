@@ -79,12 +79,20 @@ def _to_float_from_percent(value: Any) -> Optional[float]:
 
 def _prepare_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     working = df.copy()
+
+    # 퍼센트/문자 → float
     for col in NUMERIC_PERCENT_COLS:
         if col in working.columns:
             working[col] = working[col].map(_to_float_from_percent)
+
+    # 누락 컬럼을 NaN으로 만들어서 파이프라인(Imputer)이 처리하도록
     missing = [col for col in FEATURE_COLS if col not in working.columns]
     if missing:
-        raise ValueError(f"Missing required feature columns: {missing}")
+        print(f"[credit_model] ⚠️ CSV에 누락된 컬럼: {missing}")
+        for col in missing:
+            working[col] = np.nan  # Imputer 없다면 0.0 등으로
+
+    # 최종 컬럼 순서 고정
     return working[FEATURE_COLS].copy()
 
 

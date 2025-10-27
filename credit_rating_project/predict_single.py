@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-import argparse
-import pandas as pd
-import numpy as np
-import joblib
-import json
 import os
+import json
+import joblib
+import numpy as np
+import pandas as pd
 from src.data_utils import _to_float_from_percent
 from src.config import NUMERIC_PERCENT_COLS, FEATURE_COLS, ARTIFACTS_DIR
 
@@ -21,8 +20,12 @@ def load_label_mapping(path: str) -> dict:
     return {int(k): v for k, v in mp["id2label"].items()}
 
 def predict(input_path: str, output_path: str):
-    # 입력 데이터 로드
-    df = pd.read_excel(input_path)
+    # 입력 데이터 로드 (확장자에 따라 처리)
+    if input_path.endswith(".csv"):
+        df = pd.read_csv(input_path)
+    else:
+        df = pd.read_excel(input_path)
+
     X = prepare_input(df)
 
     # 모델 및 전처리기 로드
@@ -57,9 +60,20 @@ def predict(input_path: str, output_path: str):
     print(f"\n✅ 예측 결과 저장됨: {output_path}")
 
 def main():
-    input_path = "data/test_dataset.xlsx"
-    output_path = os.path.join(ARTIFACTS_DIR, "test_predictions.xlsx")
-    predict(input_path, output_path)
+    # comp_features 폴더는 상위 디렉토리 위치
+    comp_features_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "comp_features"))
+    
+    csv_files = [f for f in os.listdir(comp_features_dir) if f.endswith(".csv")]
+    
+    if not csv_files:
+        print("❌ 'comp_features' 폴더에 CSV 파일이 없습니다.")
+        return
+
+    first_csv_path = os.path.join(comp_features_dir, csv_files[0])
+    output_path = os.path.join(ARTIFACTS_DIR, "first_csv_predictions.xlsx")
+
+    print(f"📂 입력 파일: {first_csv_path}")
+    predict(first_csv_path, output_path)
 
 if __name__ == "__main__":
     main()

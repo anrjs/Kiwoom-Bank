@@ -206,19 +206,26 @@ async def non_financial_alias(
 ):
     return await non_financial(identifiers=[company], year=year, industry_override=industry_override, include_score=include_score)
 
+
 @app.post("/analyze")
 async def analyze_credit(payload: Dict[str, Any] = Body(...)):
     name = (payload or {}).get("company_name")
     if not name:
         raise HTTPException(status_code=400, detail="company_name is required")
-    
+
     try:
         prediction = await run_in_threadpool(predict_for_company, name)
     except FileNotFoundError as exc:
+        # CSV 자체가 없는 경우
         raise HTTPException(status_code=404, detail=str(exc))
     except CreditModelNotReady as exc:
+        # model.joblib, label_mapping.json 없을 때
         raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:  # pragma: no cover - defensive guard
+    except ValueError as exc:
+        # 컬럼 불일치/파싱 오류 등 사용자가 조치 가능한 문제
+        raise HTTPException(status_code=422, detail=f"invalid features: {exc}")
+    except Exception as exc:
+        # 마지막 안전망: 원인 표시
         raise HTTPException(status_code=500, detail=f"credit analysis failed: {exc}")
 
     prediction.setdefault("company", name)
@@ -241,4 +248,21 @@ def debug_find(q: str, mode: IdentifierType = "auto"):
         "corp_name": getattr(c, "corp_name", None),
         "corp_code": getattr(c, "corp_code", None),
         "stock_code": getattr(c, "stock_code", None),
+    }
+
+from api.credit_model import find_latest_feature_file, load_feature_rows, FEATURE_COLS
+
+@app.get("/analyze/diag")
+def analyze_diagnose(company: str):
+    p = find_latest_feature_file(company)
+    if not p:
+        raise HTTPException(status_code=404, detail=f"No feature CSV found for '{company}'")
+    df = load_feature_rows(p)
+    return {
+        "company": company,
+        "file": str(p),
+        "shape": df.shape,
+        "columns": list(df.columns),
+        "required_FEATURE_COLS": FEATURE_COLS,
+        "head": df.head(3).to_dict(orient="records"),
     }
