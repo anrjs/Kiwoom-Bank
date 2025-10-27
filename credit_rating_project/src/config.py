@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 
-
 # 📌 실제 데이터 경로 설정 (파일 or 폴더)
-DATA_PATH = "data/sample_dataset.xlsx"
+DATA_PATH = "data/real_dataset.xlsx"
 
 # 📌 결과물 저장 폴더
 ARTIFACTS_DIR = "artifacts_signal"
 
 # 📌 컬럼 정의
-ID_COL = "company_name"
-TARGET_COL = "credit_ratings"
+ID_COL = "회사명"  # real_dataset의 첫 번째 열 이름
+TARGET_COL = "public_credit_rating"  # ✅ 실제 신용등급 컬럼명으로 수정
 
 # 퍼센트 문자열로 된 컬럼
 NUMERIC_PERCENT_COLS = [
@@ -29,7 +28,7 @@ NUMERIC_COLS = [
     "positive_ratio",
     "negative_ratio",
     "recency_weight_mean",
-    "business_profile_assessment_score"
+    "business_report_text_score"  # ✅ 새로 추가된 비정형 점수
 ]
 
 # 전체 피처 컬럼
@@ -72,15 +71,15 @@ USE_CLASS_WEIGHTS = True
 # ============================================
 # 데이터 증폭 관련 설정 (Augmentation Settings)
 # ============================================
-AUG_ENABLED = True                      # 기본적으로 증폭 활성화
-AUG_TARGET_PER_CLASS = 30              # 클래스당 최소 표본 수 목표
-AUG_MAX_SYNTHETIC_RATIO = 1.5          # 전체 데이터 대비 합성 데이터 최대 비율
-AUG_MIXUP_ALPHA = 0.4                  # mixup 람다 beta 분포의 알파
-AUG_MIXUP_RATIO = 0.6                  # mixup:지터 비율 중 mixup 쪽 비중
-AUG_JITTER_SCALE = 0.10                # 지터 노이즈 강도
-AUG_LO = 0.005                         # 허용 값 하한 분위수
-AUG_HI = 0.995                         # 허용 값 상한 분위수
-AUG_SEED = 42                          # 랜덤 시드 고정
+AUG_ENABLED = True
+AUG_TARGET_PER_CLASS = 30
+AUG_MAX_SYNTHETIC_RATIO = 1.5
+AUG_MIXUP_ALPHA = 0.4
+AUG_MIXUP_RATIO = 0.6
+AUG_JITTER_SCALE = 0.10
+AUG_LO = 0.005
+AUG_HI = 0.995
+AUG_SEED = 42
 
 # ============================================
 # CatBoost 단조 제약 (Monotonic Constraints)
@@ -98,5 +97,5 @@ MONOTONE_SIGNS = {
     "positive_ratio": -1,
     "negative_ratio": +1,
     "recency_weight_mean": -1,
-    "business_profile_assessment_score": -1
+    "business_report_text_score": -1  # ✅ 새로 추가
 }

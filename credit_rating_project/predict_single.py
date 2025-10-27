@@ -20,9 +20,9 @@ def load_label_mapping(path: str) -> dict:
         mp = json.load(f)
     return {int(k): v for k, v in mp["id2label"].items()}
 
-def main(args):
+def predict(input_path: str, output_path: str):
     # 입력 데이터 로드
-    df = pd.read_excel(args.input)
+    df = pd.read_excel(input_path)
     X = prepare_input(df)
 
     # 모델 및 전처리기 로드
@@ -45,19 +45,21 @@ def main(args):
     df_result["predicted_label"] = y_pred_label
 
     # CLI 출력 요약
-    print("\n📊 예측 결과:")
+    print("\n📊 예측 결과 (상위 피처 포함):")
     show_col = "stock_code" if "stock_code" in df.columns else df.columns[0]
     for i in range(len(df)):
-        print(f"{df_result[show_col].iloc[i]} → 예측 등급: {y_pred_label[i]}")
+        features = ", ".join([f"{col}={df[col].iloc[i]:.3f}" for col in FEATURE_COLS if col in df.columns])
+        print(f"{df_result[show_col].iloc[i]} → 예측 등급: {y_pred_label[i]} | 주요 피처: {features}")
 
     # 저장
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    df_result.to_excel(args.output, index=False)
-    print(f"\n✅ 예측 결과 저장됨: {args.output}")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    df_result.to_excel(output_path, index=False)
+    print(f"\n✅ 예측 결과 저장됨: {output_path}")
+
+def main():
+    input_path = "data/test_dataset.xlsx"
+    output_path = os.path.join(ARTIFACTS_DIR, "test_predictions.xlsx")
+    predict(input_path, output_path)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=str, default="data/sample_dataset.xlsx", help="예측할 엑셀 파일 경로")
-    parser.add_argument("--output", type=str, default=os.path.join(ARTIFACTS_DIR, "predictions.xlsx"), help="결과 저장 경로")
-    args = parser.parse_args()
-    main(args)
+    main()

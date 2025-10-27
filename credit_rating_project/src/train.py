@@ -1,4 +1,4 @@
-# train_with_augmentation.py
+# train_with_augmentation.py (Updated for complete classification evaluation)
 
 import os
 import json
@@ -54,14 +54,12 @@ def main(args):
     X, y, label2id, id2label = split_X_y(df)
     y_all = y.astype(int).values
 
-    # 유효 클래스 필터링 (최소 2개 이상)
     y_counts = Counter(y_all)
     valid_classes = {k for k, v in y_counts.items() if v >= 2} or set(np.unique(y_all))
     mask = np.isin(y_all, list(valid_classes))
     X = X.loc[mask].reset_index(drop=True)
     y_all = y_all[mask]
 
-    # 교차검증 folds 수 자동 조정 (최소 클래스 기준)
     min_class_count = min(Counter(y_all).values())
     n_splits = min(CV_FOLDS, min_class_count) if min_class_count >= 2 else 2
     if n_splits < 2:
@@ -170,21 +168,23 @@ def main(args):
             "class_weights": class_weights
         }, f, ensure_ascii=False, indent=2)
 
-    # 1. classification_report 저장 (이미 수정하신 부분)
+    # ✅ 유효 클래스 전체 반영: 예측에 등장한 클래스도 포함
+    labels_union = sorted(set(y_all.tolist()) | set(y_oof.tolist()))
+    # 안전하게 dict 키 타입 보정
+    id2label = {int(k): v for k, v in id2label.items()}
+    target_names_union = [id2label[i] for i in labels_union]
+
+
     with open(os.path.join(args.output_dir, "classification_report.txt"), "w", encoding="utf-8") as f:
-        labels_present = sorted(np.unique(y_all))
-        target_names_present = [id2label[i] for i in labels_present]
         report = classification_report(
             y_all, y_oof,
-            labels=labels_present,
-            target_names=target_names_present,
+            labels=labels_union,
+            target_names=target_names_union,
             zero_division=0
         )
         f.write(report)
 
-    # 2. confusion matrix 저장 (에러났던 부분 → 고쳐야 함)
-    save_confusion_matrix(y_all, y_oof, target_names_present, os.path.join(args.output_dir, "confusion_matrix.png"))
-
+    save_confusion_matrix(y_all, y_oof, target_names_union, os.path.join(args.output_dir, "confusion_matrix.png"))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

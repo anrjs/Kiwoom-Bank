@@ -11,5 +11,5 @@
   "positive_ratio",
   "negative_ratio",
   "recency_weight_mean",
-  "business_profile_assessment_score"
+  "business_report_text_score"
 ]
