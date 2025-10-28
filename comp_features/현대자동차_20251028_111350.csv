@@ -1,0 +1,2 @@
+﻿,debt_ratio,roa,total_asset_growth_rate,cfo_to_total_debt,current_ratio,quick_ratio,news_sentiment_score,news_count,sentiment_volatility,positive_ratio,negative_ratio,recency_weight_mean,business_report_text_score,public_credit_rating
+현대자동차,0.3889,0.0675,0.13019999999999998,7.5001999999999995,1.2529000000000001,1.0165,10.39,20,0.4264596001571231,0.1501002208680138,0.046198766725932726,0.9954584476811318,83.25,AAA

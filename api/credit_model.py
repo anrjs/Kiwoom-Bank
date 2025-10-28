@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import sys
+import types
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -12,9 +15,14 @@ import joblib
 import numpy as np
 import pandas as pd
 
-import sys, types
-from pathlib import Path
+# (선택) .env 자동 로드: 없으면 조용히 무시
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
+# 프로젝트 루트 기준 경로
 _CREDIT_ROOT = Path(__file__).resolve().parents[1] / "credit_rating_project"
 SRC_DIR = (_CREDIT_ROOT / "src").resolve()
 
@@ -32,9 +40,8 @@ if "src" not in sys.modules:
 # features 저장 폴더 공유
 from api.features import SAVE_DIR as FEATURES_DIR  # type: ignore
 
-_CREDIT_ROOT = Path(__file__).resolve().parents[1] / "credit_rating_project"
+# config.py 경로
 _CONFIG_PATH = _CREDIT_ROOT / "src" / "config.py"
-
 if not _CONFIG_PATH.exists():
     raise RuntimeError(f"Credit rating config not found: {_CONFIG_PATH}")
 
@@ -55,11 +62,32 @@ def _get_config_attr(name: str):
         raise AttributeError(f"credit_config missing attribute '{name}'")
     return getattr(module, name)
 
+def _resolve_artifacts_dir() -> Path:
+    """
+    CREDIT_MODEL_PATH 환경변수가 있으면 그 경로를 사용.
+    - 상대경로면: 이 파일 기준 프로젝트 루트(_CREDIT_ROOT)에 붙여 절대경로로 변환.
+    - 절대경로면: 그대로 사용.
+    없으면 config.py의 ARTIFACTS_DIR을 기본 경로로 사용.
+    """
+    env_path = os.getenv("CREDIT_MODEL_PATH", "").strip()
+    if env_path:
+        p = Path(env_path)
+        if not p.is_absolute():
+            p = (_CREDIT_ROOT / p).resolve()
+        return p
+    return (_CREDIT_ROOT / _get_config_attr("ARTIFACTS_DIR")).resolve()
+
 FEATURE_COLS: List[str] = list(_get_config_attr("FEATURE_COLS"))
 NUMERIC_PERCENT_COLS: List[str] = list(_get_config_attr("NUMERIC_PERCENT_COLS"))
-_ARTIFACTS_DIR = (_CREDIT_ROOT / _get_config_attr("ARTIFACTS_DIR")).resolve()
+
+# ✅ 환경변수 오버라이드가 반영된 artifacts 경로
+_ARTIFACTS_DIR = _resolve_artifacts_dir()
 _MODEL_BUNDLE_PATH = _ARTIFACTS_DIR / "model.joblib"
 _LABEL_MAPPING_PATH = _ARTIFACTS_DIR / "label_mapping.json"
+
+print(f"[credit_model] 🗂 artifacts_dir: {_ARTIFACTS_DIR}")
+print(f"[credit_model]  ├─ model exists:       {_MODEL_BUNDLE_PATH.exists()} ({_MODEL_BUNDLE_PATH})")
+print(f"[credit_model]  └─ label map exists:   {_LABEL_MAPPING_PATH.exists()} ({_LABEL_MAPPING_PATH})")
 
 class CreditModelNotReady(RuntimeError):
     """Raised when the credit model artifacts are missing."""
