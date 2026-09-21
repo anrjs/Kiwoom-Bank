@@ -123,7 +123,17 @@ def _find_cmpcd_candidates_from_search_html(html: str) -> list[str]:
     return codes
 
 
-def search_cmpcd(driver, company: str, wait_timeout: int = SEARCH_TIMEOUT) -> list[str]:
+def search_cmpcd(driver, company: str, wait_timeout: int = SEARCH_TIMEOUT,
+                  table_wait_extra: float = 1.5) -> list[str]:
+    """
+    ⚠️ 수정 이력: 처음 버전은 결과를 못 찾으면 그냥 빈 리스트를 반환했는데,
+    실제 실행해보니 삼성전자/현대차/POSCO홀딩스 같은 초대형 기업들도 후보 0개로
+    나오는 문제가 있었음. 원인은 검색결과 테이블이 비동기로 늦게 렌더링되는데
+    WebDriverWait 조건(페이지 아무 <table>이나 있으면 통과)이 너무 느슨해서
+    실제 결과 테이블이 뜨기 전에 page_source를 읽어버린 것으로 추정.
+    → nice_rating/crawler_impl.py의 search_and_collect_resilient()가 쓰는
+      "못 찾으면 조금 더 기다렸다가 한 번 더 읽기" 패턴을 그대로 복사해 추가.
+    """
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.common.by import By
@@ -144,7 +154,30 @@ def search_cmpcd(driver, company: str, wait_timeout: int = SEARCH_TIMEOUT) -> li
     if "cmpCd" in q and q["cmpCd"]:
         return [q["cmpCd"][0]]
 
+    codes = _find_cmpcd_candidates_from_search_html(driver.page_source)
+    if codes:
+        return codes
+
+    # 못 찾았으면 렌더링이 덜 됐을 수 있으니 더 기다렸다가 한 번 더 시도
+    time.sleep(table_wait_extra)
+    q = parse_qs(urlparse(driver.current_url).query)
+    if "cmpCd" in q and q["cmpCd"]:
+        return [q["cmpCd"][0]]
     return _find_cmpcd_candidates_from_search_html(driver.page_source)
+
+
+def _sync_cookies(driver, session: requests.Session) -> None:
+    """
+    ⚠️ 추가된 수정: 검색은 Selenium(브라우저) 세션으로, 상세페이지 조회는 별도
+    requests 세션으로 하다 보니 둘이 쿠키를 공유하지 않아서 상세조회가
+    대량으로 500(Transient)을 받는 문제가 있었음. 브라우저가 받아온 쿠키를
+    requests 세션에 그대로 옮겨서 같은 세션처럼 보이게 함.
+    """
+    try:
+        for c in driver.get_cookies():
+            session.cookies.set(c["name"], c["value"], domain=c.get("domain"))
+    except Exception:
+        pass
 
 
 # ──────────────────────────────────────────────
@@ -278,6 +311,8 @@ def main():
             except Exception as e:
                 print(f"    검색 실패: {e}")
                 cmpcds = []
+
+            _sync_cookies(driver, session)  # 검색 직후 브라우저 쿠키를 requests 세션에 반영
 
             history, note = [], ""
             for cmpcd in cmpcds:
